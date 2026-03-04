@@ -238,8 +238,8 @@ async function run() {
       arguments: { action: 'status' },
     }, 8), 8);
   const statusData = JSON.parse(statusRes.result.content[0].text);
-  assert(statusData.activeGroupCount === 3, `Active group count = ${statusData.activeGroupCount} (expected 3)`);
-  const activeNames = statusData.activeGroups.map(g => g.name).sort();
+  assert(statusData.dynamicGroups.activeCount === 3, `Active group count = ${statusData.dynamicGroups.activeCount} (expected 3)`);
+  const activeNames = statusData.dynamicGroups.groups.map(g => g.name).sort();
   assert(JSON.stringify(activeNames) === '["animation","audio","dap"]', `Active groups = ${activeNames}`);
 
   const { response: listGroupsRes } = await sendAndReceiveById(proc,
@@ -248,11 +248,16 @@ async function run() {
       arguments: { action: 'list' },
     }, 9), 9);
   const listGroupsData = JSON.parse(listGroupsRes.result.content[0].text);
-  assert(listGroupsData.totalGroups === 22, `Total groups = ${listGroupsData.totalGroups} (expected 22)`);
+  assert(listGroupsData.totalGroups === 34, `Total groups = ${listGroupsData.totalGroups} (expected 34)`);
   const animGroup = listGroupsData.groups.find(g => g.name === 'animation');
   assert(animGroup?.active === true, 'animation group shows as active in list');
   const navGroup = listGroupsData.groups.find(g => g.name === 'navigation');
   assert(navGroup?.active === false, 'navigation group shows as inactive in list');
+  const coreSceneGroup = listGroupsData.groups.find(g => g.name === 'core_scene');
+  assert(coreSceneGroup?.alwaysVisible === true, 'core_scene group is alwaysVisible');
+  assert(coreSceneGroup?.type === 'core', 'core_scene has type core');
+  assert(listGroupsData.coreGroups === 12, `Core groups = ${listGroupsData.coreGroups} (expected 12)`);
+  assert(listGroupsData.dynamicGroups === 22, `Dynamic groups = ${listGroupsData.dynamicGroups} (expected 22)`);
 
   // ── Phase 6: Deactivation ──────────────────────────────────
   console.log('\n[Phase 6] Deactivation');

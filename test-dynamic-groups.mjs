@@ -261,12 +261,12 @@ async function main() {
       arguments: { action: 'status' },
     });
     const statusPayload = parseToolCallJson(statusResponse);
-    const statusActiveNames = new Set((statusPayload.activeGroups || []).map((group) => group?.name));
+    const statusActiveNames = new Set((statusPayload.dynamicGroups?.groups || []).map((group) => group?.name));
 
     assert(
       statusActiveNames.has('animation'),
       'manage_tool_groups status shows animation as active',
-      `Expected status active groups to include animation, got: ${JSON.stringify(statusPayload.activeGroups)}`,
+      `Expected status active groups to include animation, got: ${JSON.stringify(statusPayload.dynamicGroups?.groups)}`,
     );
 
     const resetResponse = await client.send('tools/call', {

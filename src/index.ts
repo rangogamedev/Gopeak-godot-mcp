@@ -202,6 +202,73 @@ const TOOL_GROUPS: Record<string, { description: string; tools: string[]; keywor
     keywords: ['version gate', 'validate patch', 'version constraint', 'version check'],
   },
 };
+
+/**
+ * Core tool groups — always visible, never deactivated.
+ * These categorize the 33 default compact-profile tools for structured discovery.
+ */
+const CORE_TOOL_GROUPS: Record<string, { description: string; tools: string[]; keywords: string[] }> = {
+  core_meta: {
+    description: 'Tool discovery and group management',
+    tools: ['tool_catalog', 'manage_tool_groups'],
+    keywords: ['catalog', 'discover', 'search tools', 'groups', 'manage groups'],
+  },
+  core_project: {
+    description: 'Project discovery, info, search, and settings',
+    tools: ['list_projects', 'get_project_info', 'search_project', 'get_project_setting', 'set_project_setting'],
+    keywords: ['project', 'list projects', 'project info', 'project search', 'project setting'],
+  },
+  core_editor: {
+    description: 'Editor launch, run, stop, debug output, and version info',
+    tools: ['launch_editor', 'run_project', 'stop_project', 'get_debug_output', 'get_editor_status', 'get_godot_version'],
+    keywords: ['editor', 'launch', 'run game', 'stop game', 'debug output', 'editor status', 'godot version'],
+  },
+  core_scene: {
+    description: 'Scene creation, saving, node tree manipulation',
+    tools: ['create_scene', 'save_scene', 'list_scene_nodes', 'add_node', 'get_node_properties', 'set_node_properties', 'delete_node'],
+    keywords: ['scene', 'node', 'create scene', 'add node', 'delete node', 'node properties', 'scene tree'],
+  },
+  core_script: {
+    description: 'GDScript creation, modification, and analysis',
+    tools: ['create_script', 'modify_script', 'get_script_info'],
+    keywords: ['script', 'gdscript', 'create script', 'modify script', 'script info'],
+  },
+  core_class: {
+    description: 'ClassDB querying and class introspection',
+    tools: ['query_classes', 'query_class_info'],
+    keywords: ['class', 'classdb', 'query class', 'class info', 'node types'],
+  },
+  core_signal: {
+    description: 'Signal connection',
+    tools: ['connect_signal'],
+    keywords: ['connect signal', 'signal'],
+  },
+  core_resource: {
+    description: 'Resource dependency analysis',
+    tools: ['get_dependencies'],
+    keywords: ['dependencies', 'resource deps', 'dependency tree'],
+  },
+  core_export: {
+    description: 'Export presets and project export/build',
+    tools: ['list_export_presets', 'export_project'],
+    keywords: ['export', 'build', 'export preset', 'publish'],
+  },
+  core_runtime: {
+    description: 'Runtime connection status',
+    tools: ['get_runtime_status'],
+    keywords: ['runtime status', 'game status', 'runtime connection'],
+  },
+  core_visualizer: {
+    description: 'Interactive project code map visualization',
+    tools: ['map_project'],
+    keywords: ['visualize', 'code map', 'project map', 'visualizer'],
+  },
+  core_diagnostics: {
+    description: 'GDScript diagnostics and DAP debug output',
+    tools: ['lsp_get_diagnostics', 'dap_get_output'],
+    keywords: ['diagnostics', 'errors', 'warnings', 'linting', 'debug output'],
+  },
+};
 /**
  * Main server class for the Godot MCP server
  */
@@ -885,17 +952,35 @@ class GodotServer {
       reverseAlias.set(legacyName, compactName);
     }
 
+    // Build tool → group reverse map (core + dynamic)
+    const toolToGroup = new Map<string, { group: string; type: 'core' | 'dynamic' }>();
+    for (const [groupName, group] of Object.entries(CORE_TOOL_GROUPS)) {
+      for (const toolName of group.tools) {
+        toolToGroup.set(toolName, { group: groupName, type: 'core' });
+      }
+    }
+    for (const [groupName, group] of Object.entries(TOOL_GROUPS)) {
+      for (const toolName of group.tools) {
+        toolToGroup.set(toolName, { group: groupName, type: 'dynamic' });
+      }
+    }
+
     const filtered = tools.filter((tool) => {
       if (!query) return true;
       const haystack = `${tool.name} ${tool.description}`.toLowerCase();
       return haystack.includes(query);
     });
 
-    const items = filtered.slice(0, limit).map((tool) => ({
-      tool: tool.name,
-      compactAlias: reverseAlias.get(tool.name) || null,
-      description: tool.description,
-    }));
+    const items = filtered.slice(0, limit).map((tool) => {
+      const groupInfo = toolToGroup.get(tool.name) || null;
+      return {
+        tool: tool.name,
+        compactAlias: reverseAlias.get(tool.name) || null,
+        group: groupInfo?.group || null,
+        groupType: groupInfo?.type || null,
+        description: tool.description,
+      };
+    });
 
     // Auto-activate matching tool groups when query matches their keywords
     // or when the query directly matches a group's tool NAME (not description).
@@ -944,28 +1029,52 @@ class GodotServer {
 
     switch (action) {
       case 'list': {
-        const groups = Object.entries(TOOL_GROUPS).map(([name, group]) => ({
+        const coreGroups = Object.entries(CORE_TOOL_GROUPS).map(([name, group]) => ({
           name,
+          type: 'core' as const,
+          description: group.description,
+          tools: group.tools,
+          toolCount: group.tools.length,
+          alwaysVisible: true,
+        }));
+        const dynamicGroups = Object.entries(TOOL_GROUPS).map(([name, group]) => ({
+          name,
+          type: 'dynamic' as const,
           description: group.description,
           tools: group.tools,
           toolCount: group.tools.length,
           active: this.activeGroups.has(name),
         }));
+        const allGroups = [...coreGroups, ...dynamicGroups];
+        const totalCoreTools = coreGroups.reduce((sum, g) => sum + g.toolCount, 0);
+        const totalDynTools = dynamicGroups.reduce((sum, g) => sum + g.toolCount, 0);
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({ totalGroups: groups.length, groups }, null, 2),
+            text: JSON.stringify({
+              totalGroups: allGroups.length,
+              coreGroups: coreGroups.length,
+              dynamicGroups: dynamicGroups.length,
+              coreTools: totalCoreTools,
+              dynamicTools: totalDynTools,
+              groups: allGroups,
+            }, null, 2),
           }],
         };
       }
 
       case 'activate': {
+        if (groupName && CORE_TOOL_GROUPS[groupName]) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `'${groupName}' is a core group and always visible. No activation needed.` }) }],
+          };
+        }
         if (!groupName || !TOOL_GROUPS[groupName]) {
           const available = Object.keys(TOOL_GROUPS).join(', ');
           return {
             content: [{
               type: 'text',
-              text: JSON.stringify({ error: `Unknown group '${groupName}'. Available: ${available}` }),
+              text: JSON.stringify({ error: `Unknown group '${groupName}'. Available dynamic groups: ${available}` }),
             }],
           };
         }
@@ -989,12 +1098,17 @@ class GodotServer {
       }
 
       case 'deactivate': {
+        if (groupName && CORE_TOOL_GROUPS[groupName]) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `'${groupName}' is a core group and cannot be deactivated.` }) }],
+          };
+        }
         if (!groupName || !TOOL_GROUPS[groupName]) {
           const available = Object.keys(TOOL_GROUPS).join(', ');
           return {
             content: [{
               type: 'text',
-              text: JSON.stringify({ error: `Unknown group '${groupName}'. Available: ${available}` }),
+              text: JSON.stringify({ error: `Unknown group '${groupName}'. Available dynamic groups: ${available}` }),
             }],
           };
         }
@@ -1037,20 +1151,28 @@ class GodotServer {
 
       case 'status':
       default: {
+        const coreGroupDetails = Object.entries(CORE_TOOL_GROUPS).map(([name, group]) => ({
+          name,
+          type: 'core' as const,
+          description: group.description,
+          tools: group.tools,
+          alwaysVisible: true,
+        }));
         const activeGroupDetails = Array.from(this.activeGroups).map((name) => ({
           name,
+          type: 'dynamic' as const,
           description: TOOL_GROUPS[name]?.description,
           tools: TOOL_GROUPS[name]?.tools,
         }));
+        const totalCoreTools = coreGroupDetails.reduce((sum, g) => sum + g.tools.length, 0);
         const totalDynamicTools = activeGroupDetails.reduce((sum, g) => sum + (g.tools?.length || 0), 0);
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              activeGroupCount: this.activeGroups.size,
-              totalDynamicTools,
-              activeGroups: activeGroupDetails,
-              availableGroups: Object.keys(TOOL_GROUPS),
+              coreGroups: { count: coreGroupDetails.length, tools: totalCoreTools, groups: coreGroupDetails },
+              dynamicGroups: { activeCount: this.activeGroups.size, tools: totalDynamicTools, groups: activeGroupDetails },
+              availableDynamicGroups: Object.keys(TOOL_GROUPS),
             }, null, 2),
           }],
         };
@@ -1631,7 +1753,7 @@ class GodotServer {
         },
         {
           name: 'tool_catalog',
-          description: 'Discover available tools including hidden legacy tools. Use query to search by capability keywords. Matching tool groups are auto-activated and become available immediately. Available groups: scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.',
+          description: 'Discover available tools including hidden legacy tools. Use query to search by capability keywords. Results include group categorization (core/dynamic). Matching dynamic groups are auto-activated and become available immediately. Core groups (always visible): core_meta, core_project, core_editor, core_scene, core_script, core_class, core_signal, core_resource, core_export, core_runtime, core_visualizer, core_diagnostics. Dynamic groups (on-demand): scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1643,12 +1765,12 @@ class GodotServer {
         },
         {
           name: 'manage_tool_groups',
-          description: 'Manage dynamic tool groups. When you need tools not in the default set, use this to activate/deactivate groups of related tools. Actions: list (show all groups with tools), activate (enable a group), deactivate (disable a group), reset (disable all), status (show active). Available groups: scene_advanced (duplicate/reparent/sprite), uid, import_export, autoload (singletons/main scene), signal, runtime (live inspect/metrics), resource (materials/shaders), animation (tracks/tree/states), plugin, input (action mapping), tilemap, audio (buses/effects), navigation (pathfinding), theme_ui (colors/fonts/shaders), asset_store, testing (screenshots/input injection), dx_tools (error log/health/usages), intent_tracking (handoff/decisions), class_advanced (inheritance), lsp (completions/hover/symbols), dap (breakpoints/stepping), version_gate.',
+          description: 'Manage tool groups. Actions: list (show all core + dynamic groups), activate (enable a dynamic group), deactivate (disable a dynamic group), reset (disable all dynamic), status (show current state). Core groups (always visible, 33 tools): core_meta, core_project, core_editor, core_scene, core_script, core_class, core_signal, core_resource, core_export, core_runtime, core_visualizer, core_diagnostics. Dynamic groups (on-demand, 78 tools): scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.',
           inputSchema: {
             type: 'object',
             properties: {
               action: { type: 'string', description: 'Action to perform: list, activate, deactivate, reset, status', enum: ['list', 'activate', 'deactivate', 'reset', 'status'] },
-              group: { type: 'string', description: 'Group name for activate/deactivate. One of: scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.' },
+              group: { type: 'string', description: 'Group name for activate/deactivate (dynamic groups only). One of: scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.' },
             },
             required: ['action'],
           },
