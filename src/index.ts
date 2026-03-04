@@ -1630,7 +1630,7 @@ class GodotServer {
         },
         {
           name: 'tool_catalog',
-          description: 'Discover available tools including hidden legacy tools. Use query to search by capability keywords (e.g., animation, import, tilemap, audio). Matching tool groups are auto-activated and become available immediately.',
+          description: 'Discover available tools including hidden legacy tools. Use query to search by capability keywords. Matching tool groups are auto-activated and become available immediately. Available groups: scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1642,12 +1642,12 @@ class GodotServer {
         },
         {
           name: 'manage_tool_groups',
-          description: 'Manage dynamic tool groups. When you need tools not in the default set, use this to activate groups of related tools. Actions: list (show all groups), activate (enable a group), deactivate (disable a group), reset (disable all groups), status (show active groups). Groups auto-activate when tool_catalog matches their tools.',
+          description: 'Manage dynamic tool groups. When you need tools not in the default set, use this to activate/deactivate groups of related tools. Actions: list (show all groups with tools), activate (enable a group), deactivate (disable a group), reset (disable all), status (show active). Available groups: scene_advanced (duplicate/reparent/sprite), uid, import_export, autoload (singletons/main scene), signal, runtime (live inspect/metrics), resource (materials/shaders), animation (tracks/tree/states), plugin, input (action mapping), tilemap, audio (buses/effects), navigation (pathfinding), theme_ui (colors/fonts/shaders), asset_store, testing (screenshots/input injection), dx_tools (error log/health/usages), intent_tracking (handoff/decisions), class_advanced (inheritance), lsp (completions/hover/symbols), dap (breakpoints/stepping), version_gate.',
           inputSchema: {
             type: 'object',
             properties: {
               action: { type: 'string', description: 'Action to perform: list, activate, deactivate, reset, status', enum: ['list', 'activate', 'deactivate', 'reset', 'status'] },
-              group: { type: 'string', description: 'Group name (required for activate/deactivate). Use list action to see available groups.' },
+              group: { type: 'string', description: 'Group name for activate/deactivate. One of: scene_advanced, uid, import_export, autoload, signal, runtime, resource, animation, plugin, input, tilemap, audio, navigation, theme_ui, asset_store, testing, dx_tools, intent_tracking, class_advanced, lsp, dap, version_gate.' },
             },
             required: ['action'],
           },
