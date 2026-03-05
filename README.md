@@ -183,13 +183,21 @@ GoPeak also exposes two CLI bin names:
 
 ---
 
+## Documentation
+
+- [Documentation Map](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Platform Roadmap](docs/platform-roadmap.md)
+- [Unity-MCP Benchmark Plan](docs/unity-mcp-benchmark-plan.md)
+- [Release Process](docs/release-process.md)
+
 ## CI
 
 GitHub Actions runs on push/PR and executes:
 
 1. `npm run build`
 2. `npx tsc --noEmit`
-3. `npm run test:ci`
+3. `npm run smoke`
 
 Run the same checks locally:
 
