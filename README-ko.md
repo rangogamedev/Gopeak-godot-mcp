@@ -5,9 +5,9 @@
 [![](https://img.shields.io/badge/Node.js-339933?style=flat&logo=nodedotjs&logoColor=white 'Node.js')](https://nodejs.org/en/download/)
 [![](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white 'TypeScript')](https://www.typescriptlang.org/)
 [![npm](https://img.shields.io/npm/v/gopeak?style=flat&logo=npm&logoColor=white 'npm')](https://www.npmjs.com/package/gopeak)
-[![](https://img.shields.io/github/last-commit/HaD0Yun/godot-mcp 'Last Commit')](https://github.com/HaD0Yun/godot-mcp/commits/main)
-[![](https://img.shields.io/github/stars/HaD0Yun/godot-mcp 'Stars')](https://github.com/HaD0Yun/godot-mcp/stargazers)
-[![](https://img.shields.io/github/forks/HaD0Yun/godot-mcp 'Forks')](https://github.com/HaD0Yun/godot-mcp/network/members)
+[![](https://img.shields.io/github/last-commit/HaD0Yun/Gopeak-godot-mcp 'Last Commit')](https://github.com/HaD0Yun/Gopeak-godot-mcp/commits/main)
+[![](https://img.shields.io/github/stars/HaD0Yun/Gopeak-godot-mcp 'Stars')](https://github.com/HaD0Yun/Gopeak-godot-mcp/stargazers)
+[![](https://img.shields.io/github/forks/HaD0Yun/Gopeak-godot-mcp 'Forks')](https://github.com/HaD0Yun/Gopeak-godot-mcp/network/members)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
 🌐 **언어**: [English](README.md) | **한국어** | [简体中文](README-zh.md) | [日本語](README-ja.md) | [Deutsch](README-de.md) | [Português](README-pt_BR.md)
@@ -74,7 +74,7 @@ gopeak
 ### 2) 소스에서 설치
 
 ```bash
-git clone https://github.com/HaD0Yun/godot-mcp.git
+git clone https://github.com/HaD0Yun/Gopeak-godot-mcp.git
 cd godot-mcp
 npm install
 npm run build
@@ -204,7 +204,7 @@ Godot 자동 감지가 안 되면 `GODOT_PATH`를 지정하세요.
 Godot 프로젝트 루트에서 설치:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/HaD0Yun/godot-mcp/main/install-addon.sh | bash
+curl -sL https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main/install-addon.sh | bash
 ```
 
 설치 후 **Project Settings → Plugins**에서 활성화하세요.

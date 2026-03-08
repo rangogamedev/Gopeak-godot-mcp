@@ -5,9 +5,9 @@
 [![](https://img.shields.io/badge/Node.js-339933?style=flat&logo=nodedotjs&logoColor=white 'Node.js')](https://nodejs.org/en/download/)
 [![](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white 'TypeScript')](https://www.typescriptlang.org/)
 [![npm](https://img.shields.io/npm/v/gopeak?style=flat&logo=npm&logoColor=white 'npm')](https://www.npmjs.com/package/gopeak)
-[![](https://img.shields.io/github/last-commit/HaD0Yun/godot-mcp 'Last Commit')](https://github.com/HaD0Yun/godot-mcp/commits/main)
-[![](https://img.shields.io/github/stars/HaD0Yun/godot-mcp 'Stars')](https://github.com/HaD0Yun/godot-mcp/stargazers)
-[![](https://img.shields.io/github/forks/HaD0Yun/godot-mcp 'Forks')](https://github.com/HaD0Yun/godot-mcp/network/members)
+[![](https://img.shields.io/github/last-commit/HaD0Yun/Gopeak-godot-mcp 'Last Commit')](https://github.com/HaD0Yun/Gopeak-godot-mcp/commits/main)
+[![](https://img.shields.io/github/stars/HaD0Yun/Gopeak-godot-mcp 'Stars')](https://github.com/HaD0Yun/Gopeak-godot-mcp/stargazers)
+[![](https://img.shields.io/github/forks/HaD0Yun/Gopeak-godot-mcp 'Forks')](https://github.com/HaD0Yun/Gopeak-godot-mcp/network/members)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
 ![GoPeak Hero](assets/gopeak-hero-v2.png)
@@ -169,7 +169,7 @@ gopeak
 ### C) From source
 
 ```bash
-git clone https://github.com/HaD0Yun/godot-mcp.git
+git clone https://github.com/HaD0Yun/Gopeak-godot-mcp.git
 cd godot-mcp
 npm install
 npm run build
@@ -227,13 +227,13 @@ Full release checklist: [`docs/release-process.md`](docs/release-process.md).
 Install in your Godot project folder:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/HaD0Yun/godot-mcp/main/install-addon.sh | bash
+curl -sL https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main/install-addon.sh | bash
 ```
 
 PowerShell:
 
 ```powershell
-iwr https://raw.githubusercontent.com/HaD0Yun/godot-mcp/main/install-addon.ps1 -UseBasicParsing | iex
+iwr https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main/install-addon.ps1 -UseBasicParsing | iex
 ```
 
 Then enable plugins in **Project Settings → Plugins** (especially `godot_mcp_editor` for bridge-backed scene/resource tools).

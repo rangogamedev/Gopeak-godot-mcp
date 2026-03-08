@@ -132,7 +132,7 @@ function printOnboarding(log: (...args: any[]) => void = console.log): void {
   log('║                                                      ║');
   log('║  110+ tools for Godot Engine via MCP                 ║');
   log('║                                                      ║');
-  log('║  📖 Docs:   https://github.com/HaD0Yun/godot-mcp   ║');
+  log('║  📖 Docs:   https://github.com/HaD0Yun/Gopeak-godot-mcp   ║');
   log('║  ⭐ Star:   gopeak star                              ║');
   log('║  🔄 Update: npm update -g gopeak                     ║');
   log('╚══════════════════════════════════════════════════════╝');

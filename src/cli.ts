@@ -88,7 +88,7 @@ Usage:
 Shell hooks wrap these commands with update notifications:
   claude, codex, gemini, opencode, omc, omx
 
-More info: https://github.com/HaD0Yun/godot-mcp
+More info: https://github.com/HaD0Yun/Gopeak-godot-mcp
 `.trim());
 }
 

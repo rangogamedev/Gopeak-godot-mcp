@@ -3,15 +3,15 @@
   "name": "io.github.HaD0Yun/gopeak",
   "description": "GoPeak — The most comprehensive MCP server for Godot Engine. 95+ tools, LSP, DAP, screenshots.",
   "repository": {
-    "url": "https://github.com/HaD0Yun/godot-mcp",
+    "url": "https://github.com/HaD0Yun/Gopeak-godot-mcp",
     "source": "github"
   },
-  "version": "2.2.0",
+  "version": "2.3.3",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "gopeak",
-      "version": "2.2.0",
+      "version": "2.3.3",
       "transport": {
         "type": "stdio"
       },

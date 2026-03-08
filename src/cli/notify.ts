@@ -17,7 +17,7 @@ import {
   runCommand,
 } from './utils.js';
 
-const REPO_URL = 'https://github.com/HaD0Yun/godot-mcp';
+const REPO_URL = 'https://github.com/HaD0Yun/Gopeak-godot-mcp';
 
 export async function showNotification(): Promise<void> {
   ensureGopeakDir();
@@ -78,13 +78,13 @@ async function handleStar(): Promise<void> {
   }
 
   // Check if already starred
-  const checkResult = await runCommand('gh api user/starred/HaD0Yun/godot-mcp');
+  const checkResult = await runCommand('gh api user/starred/HaD0Yun/Gopeak-godot-mcp');
   if (checkResult.code === 0) {
     console.log('  ⭐ Already starred! Thank you!');
     return;
   }
 
-  const starResult = await runCommand('gh api -X PUT user/starred/HaD0Yun/godot-mcp');
+  const starResult = await runCommand('gh api -X PUT user/starred/HaD0Yun/Gopeak-godot-mcp');
   if (starResult.code === 0) {
     console.log('  ⭐ Starred! Thank you for your support!');
   } else {

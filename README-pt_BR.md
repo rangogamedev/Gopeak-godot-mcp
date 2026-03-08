@@ -6,9 +6,9 @@
 [![](https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white 'TypeScript')](https://www.typescriptlang.org/)
 [![npm](https://img.shields.io/npm/v/gopeak?style=flat&logo=npm&logoColor=white 'npm')](https://www.npmjs.com/package/gopeak)
 
-[![](https://img.shields.io/github/last-commit/HaD0Yun/godot-mcp 'Last Commit')](https://github.com/HaD0Yun/godot-mcp/commits/main)
-[![](https://img.shields.io/github/stars/HaD0Yun/godot-mcp 'Stars')](https://github.com/HaD0Yun/godot-mcp/stargazers)
-[![](https://img.shields.io/github/forks/HaD0Yun/godot-mcp 'Forks')](https://github.com/HaD0Yun/godot-mcp/network/members)
+[![](https://img.shields.io/github/last-commit/HaD0Yun/Gopeak-godot-mcp 'Last Commit')](https://github.com/HaD0Yun/Gopeak-godot-mcp/commits/main)
+[![](https://img.shields.io/github/stars/HaD0Yun/Gopeak-godot-mcp 'Stars')](https://github.com/HaD0Yun/Gopeak-godot-mcp/stargazers)
+[![](https://img.shields.io/github/forks/HaD0Yun/Gopeak-godot-mcp 'Forks')](https://github.com/HaD0Yun/Gopeak-godot-mcp/network/members)
 [![](https://img.shields.io/badge/License-MIT-red.svg 'MIT License')](https://opensource.org/licenses/MIT)
 
 🌐 **Escolher idioma**: [English](README.md) | [한국어](README-ko.md) | [简体中文](README-zh.md) | [日本語](README-ja.md) | [Deutsch](README-de.md) | **Português**
@@ -344,7 +344,7 @@ Obtenha insights acionáveis sobre estrutura do projeto, recursos não utilizado
 
 **Linux / macOS**
 ```bash
-curl -sL https://raw.githubusercontent.com/HaD0Yun/godot-mcp/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main/install.sh | bash
 ```
 
 Este script irá:
@@ -375,7 +375,7 @@ gopeak
 #### Passo 1: Instalar e Fazer Build
 
 ```bash
-git clone https://github.com/HaD0Yun/godot-mcp.git
+git clone https://github.com/HaD0Yun/Gopeak-godot-mcp.git
 cd godot-mcp
 npm install
 npm run build
@@ -490,7 +490,7 @@ Após configurado, você pode usar linguagem natural para controlar o Godot:
 **Linux / macOS:**
 ```bash
 # Execute na pasta do seu projeto Godot
-curl -sL https://raw.githubusercontent.com/HaD0Yun/godot-mcp/main/install-addon.sh | bash
+curl -sL https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main/install-addon.sh | bash
 ```
 
 **Instalação Manual:**
