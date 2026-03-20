@@ -7697,32 +7697,15 @@ class GodotServer {
     }
 
     try {
-      // Runtime inspection requires a running Godot instance
-      if (!this.activeProcess) {
-        return this.createErrorResponse(
-          'No active Godot process',
-          ['Use run_project to start a Godot instance first']
-        );
-      }
-
-      // Return information about the running process
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'running',
-            nodePath: args.nodePath || '/',
-            depth: args.depth || 3,
-            note: 'Runtime tree inspection requires the godot_mcp_runtime addon. Current output shows debug logs.',
-            recentOutput: this.activeProcess.output.slice(-20),
-            recentErrors: this.activeProcess.errors.slice(-10),
-          }, null, 2),
-        }],
-      };
+      return await this.handleRuntimeCommand('get_tree', {
+        root: args.nodePath || '/root',
+        depth: args.depth || 3,
+        include_properties: Boolean(args.includeProperties),
+      });
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to inspect runtime tree: ${error?.message || 'Unknown error'}`,
-        ['Ensure a Godot process is running']
+        ['Ensure a Godot process is running with the runtime addon enabled']
       );
     }
   }
@@ -7741,28 +7724,11 @@ class GodotServer {
     }
 
     try {
-      if (!this.activeProcess) {
-        return this.createErrorResponse(
-          'No active Godot process',
-          ['Use run_project to start a Godot instance first']
-        );
-      }
-
-      // Runtime property modification requires the addon
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'not_implemented',
-            note: 'Runtime property modification requires the godot_mcp_runtime addon installed in the running project.',
-            requested: {
-              nodePath: args.nodePath,
-              property: args.property,
-              value: args.value,
-            },
-          }, null, 2),
-        }],
-      };
+      return await this.handleRuntimeCommand('set_property', {
+        path: args.nodePath,
+        property: args.property,
+        value: args.value,
+      });
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to set runtime property: ${error?.message || 'Unknown error'}`,
@@ -7785,28 +7751,11 @@ class GodotServer {
     }
 
     try {
-      if (!this.activeProcess) {
-        return this.createErrorResponse(
-          'No active Godot process',
-          ['Use run_project to start a Godot instance first']
-        );
-      }
-
-      // Runtime method calling requires the addon
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'not_implemented',
-            note: 'Runtime method calling requires the godot_mcp_runtime addon installed in the running project.',
-            requested: {
-              nodePath: args.nodePath,
-              method: args.method,
-              args: args.args || [],
-            },
-          }, null, 2),
-        }],
-      };
+      return await this.handleRuntimeCommand('call_method', {
+        path: args.nodePath,
+        method: args.method,
+        args: Array.isArray(args.args) ? args.args : [],
+      });
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to call runtime method: ${error?.message || 'Unknown error'}`,
@@ -7829,28 +7778,9 @@ class GodotServer {
     }
 
     try {
-      if (!this.activeProcess) {
-        return this.createErrorResponse(
-          'No active Godot process',
-          ['Use run_project to start a Godot instance first']
-        );
-      }
-
-      // Basic metrics from process output
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'running',
-            metrics: {
-              outputLines: this.activeProcess.output.length,
-              errorLines: this.activeProcess.errors.length,
-              note: 'Detailed metrics require the godot_mcp_runtime addon.',
-            },
-            requestedMetrics: args.metrics || 'all',
-          }, null, 2),
-        }],
-      };
+      return await this.handleRuntimeCommand('get_metrics', {
+        metrics: Array.isArray(args.metrics) ? args.metrics : [],
+      });
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to get runtime metrics: ${error?.message || 'Unknown error'}`,

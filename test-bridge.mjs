@@ -282,6 +282,10 @@ async function main() {
 
   let statusToolName = 'get_editor_status';
   let runtimeStatusToolName = 'get_runtime_status';
+  let inspectRuntimeTreeToolName = 'inspect_runtime_tree';
+  let setRuntimePropertyToolName = 'set_runtime_property';
+  let callRuntimeMethodToolName = 'call_runtime_method';
+  let getRuntimeMetricsToolName = 'get_runtime_metrics';
   let sceneCreateToolName = 'create_scene';
   let captureScreenshotToolName = 'capture_screenshot';
   let captureViewportToolName = 'capture_viewport';
@@ -300,6 +304,10 @@ async function main() {
     }
     statusToolName = chooseTool(toolNames, ['editor.status', 'get_editor_status']);
     runtimeStatusToolName = chooseTool(toolNames, ['runtime.status', 'get_runtime_status']);
+    inspectRuntimeTreeToolName = chooseTool(toolNames, ['inspect_runtime_tree']);
+    setRuntimePropertyToolName = chooseTool(toolNames, ['set_runtime_property']);
+    callRuntimeMethodToolName = chooseTool(toolNames, ['call_runtime_method']);
+    getRuntimeMetricsToolName = chooseTool(toolNames, ['get_runtime_metrics']);
     sceneCreateToolName = chooseTool(toolNames, ['scene.create', 'create_scene']);
     captureScreenshotToolName = chooseTool(toolNames, ['capture_screenshot']);
     captureViewportToolName = chooseTool(toolNames, ['capture_viewport']);
@@ -425,6 +433,51 @@ async function main() {
         socket.write(`${JSON.stringify({ type: 'welcome', protocol: 'godot_mcp_runtime', version: '1.0.0' })}\n`);
         if (request.command === 'ping') {
           socket.write(`${JSON.stringify({ type: 'pong', id: request.id, timestamp: Date.now() })}\n`);
+        } else if (request.command === 'get_tree') {
+          socket.write(`${JSON.stringify({
+            type: 'tree',
+            id: request.id,
+            root: {
+              name: 'root',
+              type: 'Node',
+              path: request.params?.root || '/root',
+              children: [
+                {
+                  name: 'Player',
+                  type: 'CharacterBody2D',
+                  path: `${request.params?.root || '/root'}/Player`,
+                },
+              ],
+            },
+          })}\n`);
+        } else if (request.command === 'set_property') {
+          socket.write(`${JSON.stringify({
+            type: 'property_set',
+            id: request.id,
+            path: request.params?.path,
+            property: request.params?.property,
+            old_value: false,
+            new_value: request.params?.value,
+          })}\n`);
+        } else if (request.command === 'call_method') {
+          socket.write(`${JSON.stringify({
+            type: 'method_result',
+            id: request.id,
+            path: request.params?.path,
+            method: request.params?.method,
+            result: {
+              echoed_args: request.params?.args || [],
+            },
+          })}\n`);
+        } else if (request.command === 'get_metrics') {
+          socket.write(`${JSON.stringify({
+            type: 'metrics',
+            id: request.id,
+            data: {
+              fps: 60,
+              object_node_count: 42,
+            },
+          })}\n`);
         } else if (request.command === 'capture_screenshot' || request.command === 'capture_viewport') {
           socket.write(`${JSON.stringify({
             type: 'screenshot',
@@ -460,6 +513,66 @@ async function main() {
     ok('get_runtime_status reports connected when runtime addon responds to ping');
   } else {
     fail('get_runtime_status connected state', JSON.stringify(runtimeConnectedResponses[0] || null));
+  }
+
+  stdout = '';
+  server.stdin.write(rpcMsg('tools/call', {
+    name: inspectRuntimeTreeToolName,
+    arguments: { projectPath: TEST_PROJECT, nodePath: '/root', depth: 2 }
+  }));
+  await delay(1500);
+
+  const inspectRuntimeResponses = parseResponses(stdout);
+  const inspectRuntimePayload = parseTextContent(inspectRuntimeResponses.find(response => response.result?.content));
+  if (inspectRuntimePayload?.type === 'tree' && inspectRuntimePayload?.root?.path === '/root') {
+    ok('inspect_runtime_tree relays runtime tree data from addon');
+  } else {
+    fail('inspect_runtime_tree relay', JSON.stringify(inspectRuntimeResponses[0] || null));
+  }
+
+  stdout = '';
+  server.stdin.write(rpcMsg('tools/call', {
+    name: setRuntimePropertyToolName,
+    arguments: { projectPath: TEST_PROJECT, nodePath: '/root/Player', property: 'visible', value: true }
+  }));
+  await delay(1500);
+
+  const setRuntimePropertyResponses = parseResponses(stdout);
+  const setRuntimePropertyPayload = parseTextContent(setRuntimePropertyResponses.find(response => response.result?.content));
+  if (setRuntimePropertyPayload?.type === 'property_set' && setRuntimePropertyPayload?.new_value === true) {
+    ok('set_runtime_property relays addon property updates');
+  } else {
+    fail('set_runtime_property relay', JSON.stringify(setRuntimePropertyResponses[0] || null));
+  }
+
+  stdout = '';
+  server.stdin.write(rpcMsg('tools/call', {
+    name: callRuntimeMethodToolName,
+    arguments: { projectPath: TEST_PROJECT, nodePath: '/root/Player', method: 'jump', args: [1, 2] }
+  }));
+  await delay(1500);
+
+  const callRuntimeMethodResponses = parseResponses(stdout);
+  const callRuntimeMethodPayload = parseTextContent(callRuntimeMethodResponses.find(response => response.result?.content));
+  if (callRuntimeMethodPayload?.type === 'method_result' && Array.isArray(callRuntimeMethodPayload?.result?.echoed_args)) {
+    ok('call_runtime_method relays addon method results');
+  } else {
+    fail('call_runtime_method relay', JSON.stringify(callRuntimeMethodResponses[0] || null));
+  }
+
+  stdout = '';
+  server.stdin.write(rpcMsg('tools/call', {
+    name: getRuntimeMetricsToolName,
+    arguments: { projectPath: TEST_PROJECT, metrics: ['fps'] }
+  }));
+  await delay(1500);
+
+  const runtimeMetricsResponses = parseResponses(stdout);
+  const runtimeMetricsPayload = parseTextContent(runtimeMetricsResponses.find(response => response.result?.content));
+  if (runtimeMetricsPayload?.type === 'metrics' && runtimeMetricsPayload?.data?.fps === 60) {
+    ok('get_runtime_metrics relays addon metrics');
+  } else {
+    fail('get_runtime_metrics relay', JSON.stringify(runtimeMetricsResponses[0] || null));
   }
 
   stdout = '';
