@@ -322,7 +322,7 @@ Visualize your entire project architecture with `visualizer.map` (`map_project` 
 | `6505` (default) | Unified Godot Bridge + Visualizer server (+ `/health`, `/mcp`) on loopback by default |
 | `6005` | Godot LSP |
 | `6006` | Godot DAP |
-| `7777` | Runtime addon command socket (only needed for runtime tools) |
+| `7777` | Runtime addon command socket bound to `127.0.0.1` by default (only needed for runtime tools) |
 
 ### Minimal port profiles
 
