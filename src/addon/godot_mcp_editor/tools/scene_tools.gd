@@ -81,54 +81,104 @@ func _find_node(root: Node, path: String) -> Node:
 	return root.get_node_or_null(path)
 
 
-func _parse_value(value):
-	if typeof(value) == TYPE_DICTIONARY and value.has("type"):
-		match value["type"]:
-			"Vector2":
-				return Vector2(value.get("x", 0), value.get("y", 0))
-			"Vector3":
-				return Vector3(value.get("x", 0), value.get("y", 0), value.get("z", 0))
-			"Color":
-				return Color(value.get("r", 1), value.get("g", 1), value.get("b", 1), value.get("a", 1))
-			"Vector2i":
-				return Vector2i(value.get("x", 0), value.get("y", 0))
-			"Vector3i":
-				return Vector3i(value.get("x", 0), value.get("y", 0), value.get("z", 0))
-			"Rect2":
-				return Rect2(value.get("x", 0), value.get("y", 0), value.get("width", 0), value.get("height", 0))
-			"Transform2D":
-				if value.has("x") and value.has("y") and value.has("origin"):
-					var xx: Dictionary = value["x"]
-					var yy: Dictionary = value["y"]
-					var oo: Dictionary = value["origin"]
-					return Transform2D(
-						Vector2(xx.get("x", 1), xx.get("y", 0)),
-						Vector2(yy.get("x", 0), yy.get("y", 1)),
-						Vector2(oo.get("x", 0), oo.get("y", 0))
-					)
-			"Transform3D":
-				if value.has("basis") and value.has("origin"):
-					var b: Dictionary = value["basis"]
-					var o: Dictionary = value["origin"]
-					var basis := Basis(
-						Vector3(b.get("x", {}).get("x", 1), b.get("x", {}).get("y", 0), b.get("x", {}).get("z", 0)),
-						Vector3(b.get("y", {}).get("x", 0), b.get("y", {}).get("y", 1), b.get("y", {}).get("z", 0)),
-						Vector3(b.get("z", {}).get("x", 0), b.get("z", {}).get("y", 0), b.get("z", {}).get("z", 1))
-					)
-					return Transform3D(basis, Vector3(o.get("x", 0), o.get("y", 0), o.get("z", 0)))
-			"NodePath":
-				return NodePath(value.get("path", ""))
-			"Resource":
-				var resource_path: String = str(value.get("path", ""))
-				if resource_path.is_empty():
-					return null
-				return load(resource_path)
+func _parse_value(value, expected_type: int = TYPE_NIL):
+	if typeof(value) == TYPE_DICTIONARY:
+		var type_tag := ""
+		if value.has("type"):
+			type_tag = str(value["type"])
+		elif value.has("_type"):
+			type_tag = str(value["_type"])
+
+		if not type_tag.is_empty():
+			match type_tag:
+				"Vector2":
+					return Vector2(value.get("x", 0), value.get("y", 0))
+				"Vector3":
+					return Vector3(value.get("x", 0), value.get("y", 0), value.get("z", 0))
+				"Color":
+					return Color(value.get("r", 1), value.get("g", 1), value.get("b", 1), value.get("a", 1))
+				"Vector2i":
+					return Vector2i(value.get("x", 0), value.get("y", 0))
+				"Vector3i":
+					return Vector3i(value.get("x", 0), value.get("y", 0), value.get("z", 0))
+				"Rect2":
+					return Rect2(value.get("x", 0), value.get("y", 0), value.get("width", 0), value.get("height", 0))
+				"Transform2D":
+					if value.has("x") and value.has("y") and value.has("origin"):
+						var xx: Dictionary = value["x"]
+						var yy: Dictionary = value["y"]
+						var oo: Dictionary = value["origin"]
+						return Transform2D(
+							Vector2(xx.get("x", 1), xx.get("y", 0)),
+							Vector2(yy.get("x", 0), yy.get("y", 1)),
+							Vector2(oo.get("x", 0), oo.get("y", 0))
+						)
+				"Transform3D":
+					if value.has("basis") and value.has("origin"):
+						var b: Dictionary = value["basis"]
+						var o: Dictionary = value["origin"]
+						var basis := Basis(
+							Vector3(b.get("x", {}).get("x", 1), b.get("x", {}).get("y", 0), b.get("x", {}).get("z", 0)),
+							Vector3(b.get("y", {}).get("x", 0), b.get("y", {}).get("y", 1), b.get("y", {}).get("z", 0)),
+							Vector3(b.get("z", {}).get("x", 0), b.get("z", {}).get("y", 0), b.get("z", {}).get("z", 1))
+						)
+						return Transform3D(basis, Vector3(o.get("x", 0), o.get("y", 0), o.get("z", 0)))
+				"NodePath":
+					return NodePath(value.get("path", ""))
+				"Resource":
+					var resource_path: String = str(value.get("path", ""))
+					if resource_path.is_empty():
+						return null
+					return load(resource_path)
+
+		match expected_type:
+			TYPE_VECTOR2:
+				if value.has("x") and value.has("y"):
+					return Vector2(value.get("x", 0), value.get("y", 0))
+			TYPE_VECTOR2I:
+				if value.has("x") and value.has("y"):
+					return Vector2i(value.get("x", 0), value.get("y", 0))
+			TYPE_VECTOR3:
+				if value.has("x") and value.has("y") and value.has("z"):
+					return Vector3(value.get("x", 0), value.get("y", 0), value.get("z", 0))
+			TYPE_VECTOR3I:
+				if value.has("x") and value.has("y") and value.has("z"):
+					return Vector3i(value.get("x", 0), value.get("y", 0), value.get("z", 0))
+			TYPE_COLOR:
+				if value.has("r") and value.has("g") and value.has("b"):
+					return Color(value.get("r", 1), value.get("g", 1), value.get("b", 1), value.get("a", 1))
+			TYPE_RECT2:
+				if value.has("x") and value.has("y") and value.has("width") and value.has("height"):
+					return Rect2(value.get("x", 0), value.get("y", 0), value.get("width", 0), value.get("height", 0))
+			TYPE_NODE_PATH:
+				if value.has("path"):
+					return NodePath(value.get("path", ""))
 	if typeof(value) == TYPE_ARRAY:
+		match expected_type:
+			TYPE_VECTOR2:
+				if value.size() >= 2:
+					return Vector2(value[0], value[1])
+			TYPE_VECTOR2I:
+				if value.size() >= 2:
+					return Vector2i(value[0], value[1])
+			TYPE_VECTOR3:
+				if value.size() >= 3:
+					return Vector3(value[0], value[1], value[2])
+			TYPE_VECTOR3I:
+				if value.size() >= 3:
+					return Vector3i(value[0], value[1], value[2])
 		var result: Array = []
 		for item in value:
 			result.append(_parse_value(item))
 		return result
 	return value
+
+
+func _get_property_type(node: Node, prop_name: String) -> int:
+	for prop in node.get_property_list():
+		if str(prop.get("name", "")) == prop_name:
+			return int(prop.get("type", TYPE_NIL))
+	return TYPE_NIL
 
 
 func _serialize_value(value) -> Variant:
@@ -174,7 +224,8 @@ func _serialize_value(value) -> Variant:
 
 func _set_node_properties(node: Node, properties: Dictionary) -> void:
 	for prop_name in properties:
-		var val = _parse_value(properties[prop_name])
+		var expected_type := _get_property_type(node, str(prop_name))
+		var val = _parse_value(properties[prop_name], expected_type)
 		node.set(prop_name, val)
 
 

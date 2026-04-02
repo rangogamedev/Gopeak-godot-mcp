@@ -144,6 +144,20 @@ In `compact` mode, 78 additional tools are organized into **22 groups** that act
    > "Use `tool.groups` to reset all active groups."
 
 The server sends `notifications/tools/list_changed` so MCP clients (Claude Code, Claude Desktop) automatically refresh the tool list.
+If your MCP client caches tools aggressively and does not refresh after activation, reconnect the client or call the newly activated tool directly once to force a fresh `tools/list` round-trip.
+
+### Typed property values for scene tools
+
+Bridge-backed scene tools (`add_node`, `set_node_properties`) now coerce common vector payloads such as `{ "x": 100, "y": 200 }` and `[100, 200]` for typed properties like `position` and `scale`. Tagged values are still the safest cross-tool form:
+
+```json
+{
+  "position": { "type": "Vector2", "x": 100, "y": 200 },
+  "scale": { "type": "Vector2", "x": 2, "y": 2 }
+}
+```
+
+The internal headless serializer uses `_type`, but MCP callers should prefer `type` when they need an explicit cross-tool Godot value tag.
 
 ### Don't worry about tokens
 
@@ -353,6 +367,7 @@ Visualize your entire project architecture with `visualizer.map` (`map_project` 
 - **Project path invalid** → confirm `project.godot` exists
 - **Runtime tools not working** → install/enable runtime addon plugin
 - **Need a tool that is not visible** → run `tool.catalog` to search and auto-activate matching groups, or use `tool.groups` to activate a specific group
+- **`get_editor_status` says disconnected while the Godot editor shows connected** → check whether another `gopeak`/MCP server instance already owns bridge port `6505`; the status payload now reports the startup error and suggests stopping duplicate servers
 
 ---
 

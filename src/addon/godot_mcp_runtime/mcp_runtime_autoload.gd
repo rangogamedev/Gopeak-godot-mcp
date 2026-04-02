@@ -45,6 +45,9 @@ func _process(_delta: float) -> void:
 			continue
 		
 		client.poll()
+		if client.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			clients_to_remove.append(client)
+			continue
 		var available = client.get_available_bytes()
 		if available > 0:
 			var data = client.get_utf8_string(available)
