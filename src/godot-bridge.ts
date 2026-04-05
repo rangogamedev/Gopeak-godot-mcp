@@ -444,11 +444,14 @@ export class GodotBridge extends EventEmitter {
     nextSocket.on('close', (code, reasonBuffer) => {
       const reason = reasonBuffer.toString();
       this.log('warn', `Godot disconnected (code=${code}, reason=${reason || 'none'})`);
-      this.handleDisconnect(new Error('Godot disconnected during request'));
+      this.handleDisconnect(nextSocket, new Error('Godot disconnected during request'));
     });
 
     nextSocket.on('error', (error) => {
       this.log('error', `WebSocket error: ${error.message}`);
+      if (nextSocket.readyState === WebSocket.CLOSED || nextSocket.readyState === WebSocket.CLOSING) {
+        this.handleDisconnect(nextSocket, error);
+      }
     });
   }
 
@@ -596,7 +599,12 @@ export class GodotBridge extends EventEmitter {
     this.pingInterval = null;
   }
 
-  private handleDisconnect(reason: Error): void {
+  private handleDisconnect(disconnectedSocket: WebSocket | null, reason: Error): void {
+    if (disconnectedSocket && this.socket && disconnectedSocket !== this.socket) {
+      this.log('debug', 'Ignoring stale Godot socket disconnect event');
+      return;
+    }
+
     this.stopKeepalive();
 
     this.socket = null;

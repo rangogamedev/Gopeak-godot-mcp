@@ -34,7 +34,15 @@ func _init():
     
     var operation = args[operation_index]
     var params_json = args[params_index]
-    
+    if params_json.begins_with("@file:"):
+        var params_file_path = params_json.substr(6)
+        var params_file = FileAccess.open(params_file_path, FileAccess.READ)
+        if params_file == null:
+            log_error("Failed to open params file: " + params_file_path)
+            quit(1)
+        params_json = params_file.get_as_text()
+        params_file.close()
+
     log_info("Operation: " + operation)
     log_debug("Params JSON: " + params_json)
     

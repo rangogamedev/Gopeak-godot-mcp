@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn } from 'child_process';
 import { createConnection as createTcpConnection } from 'node:net';
 import { promisify } from 'util';
@@ -58,6 +59,7 @@ class GodotServer {
   private godotDebugMode: boolean = GODOT_DEBUG_MODE_DEFAULT;
   private lspClient: GodotLSPClient | null = null;
   private dapClient: GodotDAPClient | null = null;
+  private bridgeStartupError: string | null = null;
   private lastProjectPath: string | null = null;
   private recordingMode: 'lite' | 'full' = (process.env.LOG_MODE === 'full' ? 'full' : 'lite');
   private logQueue: Array<{ filePath: string; payload: Record<string, unknown> }> = [];
@@ -1137,8 +1139,10 @@ class GodotServer {
       if (Object.prototype.hasOwnProperty.call(params, key)) {
         let normalizedKey = key;
         
-        // If the key is in snake_case, convert it to camelCase using our mapping
-        if (key.includes('_')) {
+        // Preserve sentinel keys like _type, but normalize regular snake_case keys.
+        if (key.startsWith('_')) {
+          normalizedKey = key;
+        } else if (key.includes('_')) {
           normalizedKey = this.parameterMappings[key] || key.replace(/_([a-zA-Z0-9])/g, (_, letter: string) => letter.toUpperCase());
         }
         
@@ -1164,8 +1168,10 @@ class GodotServer {
     
     for (const key in params) {
       if (Object.prototype.hasOwnProperty.call(params, key)) {
-        // Convert camelCase to snake_case
-        const snakeKey = this.reverseParameterMappings[key] || key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+        // Convert camelCase to snake_case while preserving sentinel keys like _type.
+        const snakeKey = key.startsWith('_')
+          ? key
+          : (this.reverseParameterMappings[key] || key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`));
         
         // Handle nested objects recursively
         if (typeof params[key] === 'object' && params[key] !== null && !Array.isArray(params[key])) {
@@ -1208,16 +1214,19 @@ class GodotServer {
     }
 
     try {
-      // Serialize the snake_case parameters to a valid JSON string
+      // Serialize parameters into a temp file to avoid shell/cmd JSON escaping issues
+      // (notably Windows command-line parsing of sequences such as \t, \r, and \").
       const paramsJson = JSON.stringify(snakeCaseParams);
-      // Escape single quotes in the JSON string to prevent command injection
-      const escapedParams = paramsJson.replace(/'/g, "'\\''");
-      // On Windows, cmd.exe does not strip single quotes, so we use
-      // double quotes and escape them to ensure the JSON is parsed
-      // correctly by Godot.
+      const paramsDir = mkdtempSync(join(tmpdir(), 'gopeak-params-'));
+      const paramsFilePath = join(paramsDir, `${operation}.json`);
+      writeFileSync(paramsFilePath, paramsJson, 'utf8');
+
+      // Escape the params file reference for the current shell.
+      const paramsFileArg = `@file:${paramsFilePath}`;
+      const escapedParams = paramsFileArg.replace(/'/g, "'\\''");
       const isWindows = process.platform === 'win32';
       const quotedParams = isWindows
-        ? `\"${paramsJson.replace(/\"/g, '\\"')}\"`
+        ? `\"${paramsFileArg.replace(/\"/g, '\\"')}\"`
         : `'${escapedParams}'`;
 
 
@@ -1239,9 +1248,12 @@ class GodotServer {
 
       this.logDebug(`Command: ${cmd}`);
 
-      const { stdout, stderr } = await execAsync(cmd);
-
-      return { stdout, stderr };
+      try {
+        const { stdout, stderr } = await execAsync(cmd);
+        return { stdout, stderr };
+      } finally {
+        rmSync(paramsDir, { recursive: true, force: true });
+      }
     } catch (error: unknown) {
       // If execAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
@@ -1254,6 +1266,23 @@ class GodotServer {
 
       throw error;
     }
+  }
+
+  private getEditorStatusPayload() {
+    const status = this.godotBridge.getStatus();
+    const isPortConflict = this.bridgeStartupError?.includes('EADDRINUSE') ?? false;
+
+    return {
+      ...status,
+      bridgeAvailable: this.bridgeStartupError === null,
+      startupError: this.bridgeStartupError,
+      note: isPortConflict
+        ? 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.'
+        : undefined,
+      suggestion: isPortConflict
+        ? 'Stop duplicate gopeak/MCP server instances or re-run the command from the same server process that owns the bridge port.'
+        : undefined,
+    };
   }
 
   /**
@@ -1618,7 +1647,7 @@ class GodotServer {
           return await this.handleViaBridge('modify_resource', normalizedArgs);
         // Editor Plugin Bridge Status
         case 'get_editor_status':
-          return { content: [{ type: 'text', text: JSON.stringify(this.godotBridge.getStatus(), null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify(this.getEditorStatusPayload(), null, 2) }] };
         // Project Visualizer Tool
         case 'map_project':
           return await this.handleMapProject(request.params.arguments);
@@ -6341,10 +6370,12 @@ class GodotServer {
       // Bridge startup issues should not take down the stdio MCP server.
       try {
         await this.godotBridge.start();
+        this.bridgeStartupError = null;
         const bridgeStatus = this.godotBridge.getStatus();
         console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}`);
       } catch (bridgeError) {
         const bridgeMessage = bridgeError instanceof Error ? bridgeError.message : String(bridgeError);
+        this.bridgeStartupError = bridgeMessage;
         console.error(`[SERVER] Warning: Godot Editor Bridge failed to start: ${bridgeMessage}`);
         console.error('[SERVER] Continuing without bridge-backed editor tools.');
       }

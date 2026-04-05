@@ -64,6 +64,8 @@ npm run test:setup
 
 If a command is not relevant or fails for an existing unrelated reason, call that out in the PR description with exact output.
 
+For bridge transport, compact-profile, or tool-discovery changes, also include the targeted checks that cover those paths (typically `npm run test:dynamic-groups`, `npm run test:integration`, or the closest focused regression script).
+
 ## Capability changes
 
 When adding or changing tools, resources, prompts, or CLI behavior:
@@ -89,5 +91,6 @@ A good PR description includes:
 - why it changed
 - verification commands and results
 - any follow-up risks or compatibility notes
+- any client refresh/reconnect caveats when the change affects dynamic tool exposure or bridge connectivity
 
 Thanks again for helping improve GoPeak.

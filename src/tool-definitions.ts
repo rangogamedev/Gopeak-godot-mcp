@@ -367,7 +367,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
               },
               properties: {
                 type: 'string',
-                description: 'Optional properties to set on the node (as JSON string)',
+                description: 'Optional properties to set on the node (as JSON string). Tagged Godot values such as {"position":{"type":"Vector2","x":100,"y":200}} are the most explicit form; common typed properties like Vector2 also accept inferred shapes such as {"position":{"x":100,"y":200}} or {"position":[100,200]}.',
               },
             },
             required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
@@ -528,7 +528,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
               },
               properties: {
                 type: 'string',
-                description: 'JSON object of properties to set (e.g., {"position": {"x": 100, "y": 200}, "scale": {"x": 2, "y": 2}})',
+                description: 'JSON object of properties to set. Tagged Godot values are the most explicit form (e.g., {"position":{"type":"Vector2","x":100,"y":200},"scale":{"type":"Vector2","x":2,"y":2}}), but typed properties like Vector2 also accept inferred {"x","y"} objects and numeric arrays.',
               },
               saveScene: {
                 type: 'boolean',
