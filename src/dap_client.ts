@@ -1,5 +1,27 @@
 import { createConnection, type Socket } from 'node:net';
 
+import { getWSLInteropDetails, resolveWindowsHostIp } from './wsl_interop.js';
+
+function resolveDefaultDAPHost(): string {
+  const envOverride =
+    process.env.GOPEAK_DAP_HOST ||
+    process.env.GODOT_DAP_HOST ||
+    process.env.MCP_DAP_HOST;
+  if (envOverride) {
+    return envOverride;
+  }
+
+  const interop = getWSLInteropDetails(process.env.GODOT_PATH ?? null);
+  if (interop.mode === 'wsl_windows') {
+    const winHost = resolveWindowsHostIp();
+    if (winHost) {
+      return winHost;
+    }
+  }
+
+  return '127.0.0.1';
+}
+
 interface PendingRequest {
   resolve: (value: DAPBody | PromiseLike<DAPBody>) => void;
   reject: (reason?: unknown) => void;
@@ -50,9 +72,9 @@ export class GodotDAPClient {
   private lastThreadId: number = 1;
   private breakpoints: Map<string, Set<number>> = new Map();
 
-  constructor(port: number = 6006, host: string = '127.0.0.1') {
+  constructor(port: number = 6006, host?: string) {
     this.port = port;
-    this.host = host;
+    this.host = host ?? resolveDefaultDAPHost();
     this.pendingRequests = new Map();
   }
 

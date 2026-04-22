@@ -2,11 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
+import { release } from 'node:os';
 import type { RawData } from 'ws';
 import { WebSocket, WebSocketServer } from 'ws';
 
 const DEFAULT_PORT = 6505;
-const DEFAULT_HOST = '127.0.0.1';
+const DEFAULT_HOST = process.platform === 'linux' && release().toLowerCase().includes('microsoft') ? '0.0.0.0' : '127.0.0.1';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 10_000;
 const SECOND_CONNECTION_CLOSE_CODE = 4000;

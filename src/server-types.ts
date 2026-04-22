@@ -2,6 +2,21 @@ export interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  launchedAt: number;
+}
+
+export interface WSLInteropDetails {
+  isWSL: boolean;
+  windowsTarget: boolean;
+  mode: 'native' | 'wsl_windows' | 'wsl_linux';
+}
+
+export interface PreparedGodotCommand {
+  command: string;
+  args: string[];
+  cwd?: string;
+  projectPathForDisplay: string;
+  targetProjectPath: string;
 }
 
 export interface GodotServerConfig {
