@@ -150,6 +150,41 @@ fetch_addon_file() {
     fi
 }
 
+# stash_uids copies every *.uid file under $1 into $2, preserving
+# relative paths. `install-addon.sh` deletes the addon dir before
+# re-copying from source; Godot projects rely on stable `.uid` files
+# (editor-generated, not shipped by the fork) so autoload /.tscn
+# references keep resolving across refreshes.
+stash_uids() {
+    local addon_path="$1"
+    local stash_dir="$2"
+    if [ ! -d "$addon_path" ]; then
+        return 0
+    fi
+    (cd "$addon_path" && find . -type f -name "*.uid" -print0 2>/dev/null | tar --null -cf - -T - 2>/dev/null) | \
+        (cd "$stash_dir" && tar -xf - 2>/dev/null) || true
+}
+
+# restore_uids puts stashed .uid files back next to any matching
+# source file that survived into the new install (e.g. foo.gd.uid
+# restored only if foo.gd exists post-copy). Unmatched stashes are
+# discarded.
+restore_uids() {
+    local addon_path="$1"
+    local stash_dir="$2"
+    if [ ! -d "$stash_dir" ]; then
+        return 0
+    fi
+    (cd "$stash_dir" && find . -type f -name "*.uid" -print) 2>/dev/null | while read -r rel; do
+        local rel_clean="${rel#./}"
+        local base_path="${rel_clean%.uid}"
+        if [ -f "$addon_path/$base_path" ]; then
+            mkdir -p "$(dirname "$addon_path/$rel_clean")"
+            cp -f "$stash_dir/$rel_clean" "$addon_path/$rel_clean"
+        fi
+    done
+}
+
 install_auto_reload() {
     echo ""
     echo -e "${YELLOW}Installing Auto Reload addon...${NC}"
@@ -160,16 +195,20 @@ install_auto_reload() {
         echo -e "${YELLOW}Auto Reload addon already exists. Use --force to overwrite.${NC}"
         return 1
     fi
-    
+
+    local uid_stash
+    uid_stash=$(mktemp -d)
+    stash_uids "$addon_path" "$uid_stash"
+
     if [ -d "$addon_path" ]; then
         rm -rf "$addon_path"
     fi
-    
+
     mkdir -p "$addon_path"
-    
+
     local files=("auto_reload.gd" "plugin.cfg")
     local success=true
-    
+
     for file in "${files[@]}"; do
         if [ -n "$FROM_LOCAL" ]; then
             echo -e "  Copying $file from local..."
@@ -181,6 +220,9 @@ install_auto_reload() {
             success=false
         fi
     done
+
+    restore_uids "$addon_path" "$uid_stash"
+    rm -rf "$uid_stash"
 
     if [ "$success" = true ]; then
         echo -e "${GREEN}[✓]${NC} Auto Reload addon installed successfully!"
@@ -199,16 +241,20 @@ install_runtime() {
         echo -e "${YELLOW}Runtime addon already exists. Use --force to overwrite.${NC}"
         return 1
     fi
-    
+
+    local uid_stash
+    uid_stash=$(mktemp -d)
+    stash_uids "$addon_path" "$uid_stash"
+
     if [ -d "$addon_path" ]; then
         rm -rf "$addon_path"
     fi
-    
+
     mkdir -p "$addon_path"
-    
+
     local files=("godot_mcp_runtime.gd" "mcp_runtime_autoload.gd" "plugin.cfg")
     local success=true
-    
+
     for file in "${files[@]}"; do
         if [ -n "$FROM_LOCAL" ]; then
             echo -e "  Copying $file from local..."
@@ -220,6 +266,9 @@ install_runtime() {
             success=false
         fi
     done
+
+    restore_uids "$addon_path" "$uid_stash"
+    rm -rf "$uid_stash"
 
     if [ "$success" = true ]; then
         echo -e "${GREEN}[✓]${NC} Runtime addon installed successfully!"
@@ -238,6 +287,10 @@ install_editor_plugin() {
         echo -e "${YELLOW}Editor Bridge addon already exists. Use --force to overwrite.${NC}"
         return 1
     fi
+
+    local uid_stash
+    uid_stash=$(mktemp -d)
+    stash_uids "$addon_path" "$uid_stash"
 
     if [ -d "$addon_path" ]; then
         rm -rf "$addon_path"
@@ -267,6 +320,9 @@ install_editor_plugin() {
             success=false
         fi
     done
+
+    restore_uids "$addon_path" "$uid_stash"
+    rm -rf "$uid_stash"
 
     if [ "$success" = true ]; then
         echo -e "${GREEN}[✓]${NC} Editor Bridge addon installed successfully!"

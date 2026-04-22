@@ -92,6 +92,47 @@ function Fetch-AddonFile {
     return Download-File "$repoUrl/src/addon/$relPath" $destination
 }
 
+# Stash-UidFiles captures every *.uid file under $addonPath (preserving
+# relative paths) into $stashDir. `install-addon.ps1` deletes the addon
+# dir before re-copying; Godot projects rely on stable `.uid` files
+# (editor-generated, not shipped by the fork) so autoload / .tscn UID
+# references keep resolving across refreshes.
+function Stash-UidFiles {
+    param($addonPath, $stashDir)
+    if (-not (Test-Path $addonPath)) { return }
+    Get-ChildItem -Path $addonPath -Filter *.uid -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $rel = $_.FullName.Substring((Resolve-Path $addonPath).Path.Length).TrimStart('\', '/')
+        $target = Join-Path $stashDir $rel
+        $targetDir = Split-Path $target -Parent
+        if (-not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        Copy-Item -Path $_.FullName -Destination $target -Force
+    }
+}
+
+# Restore-UidFiles puts stashed .uid files back next to any matching
+# source file that survived into the new install (e.g. foo.gd.uid
+# restored only if foo.gd exists post-copy). Unmatched stashes are
+# discarded.
+function Restore-UidFiles {
+    param($addonPath, $stashDir)
+    if (-not (Test-Path $stashDir)) { return }
+    Get-ChildItem -Path $stashDir -Filter *.uid -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $rel = $_.FullName.Substring((Resolve-Path $stashDir).Path.Length).TrimStart('\', '/')
+        $base = $rel -replace '\.uid$', ''
+        $basePath = Join-Path $addonPath $base
+        if (Test-Path $basePath) {
+            $target = Join-Path $addonPath $rel
+            $targetDir = Split-Path $target -Parent
+            if (-not (Test-Path $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            Copy-Item -Path $_.FullName -Destination $target -Force
+        }
+    }
+}
+
 # Install Auto Reload addon
 function Install-AutoReload {
     Write-Host ""
@@ -103,33 +144,42 @@ function Install-AutoReload {
         Write-Host "Auto Reload addon already exists. Use -Force to overwrite." -ForegroundColor Yellow
         return $false
     }
-    
-    if (Test-Path $addonPath) {
-        Remove-Item -Recurse -Force $addonPath
-    }
-    
-    New-Item -ItemType Directory -Path $addonPath -Force | Out-Null
-    
-    $files = @(
-        "auto_reload.gd",
-        "plugin.cfg"
-    )
-    
-    $success = $true
-    foreach ($file in $files) {
-        $dest = "$addonPath/$file"
 
-        if ($FromLocal -ne "") {
-            Write-Host "  Copying $file from local..." -ForegroundColor Gray
-        } else {
-            Write-Host "  Downloading $file..." -ForegroundColor Gray
+    $uidStash = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "gopeak-uid-$([guid]::NewGuid().ToString())") -Force
+    try {
+        Stash-UidFiles $addonPath $uidStash.FullName
+
+        if (Test-Path $addonPath) {
+            Remove-Item -Recurse -Force $addonPath
         }
-        if (-not (Fetch-AddonFile "auto_reload/$file" $dest)) {
-            Write-Host "  Failed to fetch $file" -ForegroundColor Red
-            $success = $false
+
+        New-Item -ItemType Directory -Path $addonPath -Force | Out-Null
+
+        $files = @(
+            "auto_reload.gd",
+            "plugin.cfg"
+        )
+
+        $success = $true
+        foreach ($file in $files) {
+            $dest = "$addonPath/$file"
+
+            if ($FromLocal -ne "") {
+                Write-Host "  Copying $file from local..." -ForegroundColor Gray
+            } else {
+                Write-Host "  Downloading $file..." -ForegroundColor Gray
+            }
+            if (-not (Fetch-AddonFile "auto_reload/$file" $dest)) {
+                Write-Host "  Failed to fetch $file" -ForegroundColor Red
+                $success = $false
+            }
         }
+
+        Restore-UidFiles $addonPath $uidStash.FullName
+    } finally {
+        Remove-Item -Recurse -Force $uidStash.FullName -ErrorAction SilentlyContinue
     }
-    
+
     if ($success) {
         Write-Host "Auto Reload addon installed successfully!" -ForegroundColor Green
     }
@@ -147,34 +197,43 @@ function Install-Runtime {
         Write-Host "Runtime addon already exists. Use -Force to overwrite." -ForegroundColor Yellow
         return $false
     }
-    
-    if (Test-Path $addonPath) {
-        Remove-Item -Recurse -Force $addonPath
-    }
-    
-    New-Item -ItemType Directory -Path $addonPath -Force | Out-Null
-    
-    $files = @(
-        "godot_mcp_runtime.gd",
-        "mcp_runtime_autoload.gd",
-        "plugin.cfg"
-    )
-    
-    $success = $true
-    foreach ($file in $files) {
-        $dest = "$addonPath/$file"
 
-        if ($FromLocal -ne "") {
-            Write-Host "  Copying $file from local..." -ForegroundColor Gray
-        } else {
-            Write-Host "  Downloading $file..." -ForegroundColor Gray
+    $uidStash = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "gopeak-uid-$([guid]::NewGuid().ToString())") -Force
+    try {
+        Stash-UidFiles $addonPath $uidStash.FullName
+
+        if (Test-Path $addonPath) {
+            Remove-Item -Recurse -Force $addonPath
         }
-        if (-not (Fetch-AddonFile "godot_mcp_runtime/$file" $dest)) {
-            Write-Host "  Failed to fetch $file" -ForegroundColor Red
-            $success = $false
+
+        New-Item -ItemType Directory -Path $addonPath -Force | Out-Null
+
+        $files = @(
+            "godot_mcp_runtime.gd",
+            "mcp_runtime_autoload.gd",
+            "plugin.cfg"
+        )
+
+        $success = $true
+        foreach ($file in $files) {
+            $dest = "$addonPath/$file"
+
+            if ($FromLocal -ne "") {
+                Write-Host "  Copying $file from local..." -ForegroundColor Gray
+            } else {
+                Write-Host "  Downloading $file..." -ForegroundColor Gray
+            }
+            if (-not (Fetch-AddonFile "godot_mcp_runtime/$file" $dest)) {
+                Write-Host "  Failed to fetch $file" -ForegroundColor Red
+                $success = $false
+            }
         }
+
+        Restore-UidFiles $addonPath $uidStash.FullName
+    } finally {
+        Remove-Item -Recurse -Force $uidStash.FullName -ErrorAction SilentlyContinue
     }
-    
+
     if ($success) {
         Write-Host "Runtime addon installed successfully!" -ForegroundColor Green
     }
@@ -192,35 +251,44 @@ function Install-EditorPlugin {
         return $false
     }
 
-    if (Test-Path $addonPath) {
-        Remove-Item -Recurse -Force $addonPath
-    }
+    $uidStash = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "gopeak-uid-$([guid]::NewGuid().ToString())") -Force
+    try {
+        Stash-UidFiles $addonPath $uidStash.FullName
 
-    New-Item -ItemType Directory -Path "$addonPath/tools" -Force | Out-Null
-
-    $files = @(
-        "plugin.cfg",
-        "plugin.gd",
-        "mcp_client.gd",
-        "tool_executor.gd",
-        "tools/animation_tools.gd",
-        "tools/resource_tools.gd",
-        "tools/scene_tools.gd"
-    )
-
-    $success = $true
-    foreach ($file in $files) {
-        $dest = "$addonPath/$file"
-
-        if ($FromLocal -ne "") {
-            Write-Host "  Copying $file from local..." -ForegroundColor Gray
-        } else {
-            Write-Host "  Downloading $file..." -ForegroundColor Gray
+        if (Test-Path $addonPath) {
+            Remove-Item -Recurse -Force $addonPath
         }
-        if (-not (Fetch-AddonFile "godot_mcp_editor/$file" $dest)) {
-            Write-Host "  Failed to fetch $file" -ForegroundColor Red
-            $success = $false
+
+        New-Item -ItemType Directory -Path "$addonPath/tools" -Force | Out-Null
+
+        $files = @(
+            "plugin.cfg",
+            "plugin.gd",
+            "mcp_client.gd",
+            "tool_executor.gd",
+            "tools/animation_tools.gd",
+            "tools/resource_tools.gd",
+            "tools/scene_tools.gd"
+        )
+
+        $success = $true
+        foreach ($file in $files) {
+            $dest = "$addonPath/$file"
+
+            if ($FromLocal -ne "") {
+                Write-Host "  Copying $file from local..." -ForegroundColor Gray
+            } else {
+                Write-Host "  Downloading $file..." -ForegroundColor Gray
+            }
+            if (-not (Fetch-AddonFile "godot_mcp_editor/$file" $dest)) {
+                Write-Host "  Failed to fetch $file" -ForegroundColor Red
+                $success = $false
+            }
         }
+
+        Restore-UidFiles $addonPath $uidStash.FullName
+    } finally {
+        Remove-Item -Recurse -Force $uidStash.FullName -ErrorAction SilentlyContinue
     }
 
     if ($success) {
