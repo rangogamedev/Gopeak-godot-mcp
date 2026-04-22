@@ -4,7 +4,8 @@
 param(
     [switch]$AutoReloadOnly,
     [switch]$RuntimeOnly,
-    [switch]$Force
+    [switch]$Force,
+    [string]$FromLocal = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,21 +30,66 @@ if (-not (Test-Path "addons")) {
 
 $repoUrl = "https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main"
 
+if ($FromLocal -ne "") {
+    if (-not (Test-Path "$FromLocal/src/addon")) {
+        Write-Host "ERROR: -FromLocal path does not contain src/addon/" -ForegroundColor Red
+        Write-Host "Expected: $FromLocal/src/addon/" -ForegroundColor Yellow
+        exit 1
+    }
+    foreach ($requiredDir in @("auto_reload", "godot_mcp_editor", "godot_mcp_runtime")) {
+        if (-not (Test-Path "$FromLocal/src/addon/$requiredDir")) {
+            Write-Host "ERROR: -FromLocal path missing $requiredDir" -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
 # Function to download a file
 function Download-File {
     param($url, $destination)
-    
+
     $dir = Split-Path $destination -Parent
     if (-not (Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    
+
     try {
         Invoke-WebRequest -Uri $url -OutFile $destination -UseBasicParsing
         return $true
     } catch {
         return $false
     }
+}
+
+# Function to copy a file from a local gopeak-godot-mcp checkout
+function Copy-FromLocal {
+    param($relPath, $destination)
+
+    $dir = Split-Path $destination -Parent
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    $src = Join-Path $FromLocal "src/addon/$relPath"
+    if (-not (Test-Path $src)) {
+        Write-Host "ERROR: local source missing: $src" -ForegroundColor Red
+        return $false
+    }
+    try {
+        Copy-Item -Path $src -Destination $destination -Force
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Fetch-AddonFile {
+    param($relPath, $destination)
+
+    if ($FromLocal -ne "") {
+        return Copy-FromLocal $relPath $destination
+    }
+    return Download-File "$repoUrl/src/addon/$relPath" $destination
 }
 
 # Install Auto Reload addon
@@ -71,12 +117,15 @@ function Install-AutoReload {
     
     $success = $true
     foreach ($file in $files) {
-        $url = "$repoUrl/src/addon/auto_reload/$file"
         $dest = "$addonPath/$file"
-        
-        Write-Host "  Downloading $file..." -ForegroundColor Gray
-        if (-not (Download-File $url $dest)) {
-            Write-Host "  Failed to download $file" -ForegroundColor Red
+
+        if ($FromLocal -ne "") {
+            Write-Host "  Copying $file from local..." -ForegroundColor Gray
+        } else {
+            Write-Host "  Downloading $file..." -ForegroundColor Gray
+        }
+        if (-not (Fetch-AddonFile "auto_reload/$file" $dest)) {
+            Write-Host "  Failed to fetch $file" -ForegroundColor Red
             $success = $false
         }
     }
@@ -113,12 +162,15 @@ function Install-Runtime {
     
     $success = $true
     foreach ($file in $files) {
-        $url = "$repoUrl/src/addon/godot_mcp_runtime/$file"
         $dest = "$addonPath/$file"
-        
-        Write-Host "  Downloading $file..." -ForegroundColor Gray
-        if (-not (Download-File $url $dest)) {
-            Write-Host "  Failed to download $file" -ForegroundColor Red
+
+        if ($FromLocal -ne "") {
+            Write-Host "  Copying $file from local..." -ForegroundColor Gray
+        } else {
+            Write-Host "  Downloading $file..." -ForegroundColor Gray
+        }
+        if (-not (Fetch-AddonFile "godot_mcp_runtime/$file" $dest)) {
+            Write-Host "  Failed to fetch $file" -ForegroundColor Red
             $success = $false
         }
     }
@@ -158,12 +210,15 @@ function Install-EditorPlugin {
 
     $success = $true
     foreach ($file in $files) {
-        $url = "$repoUrl/src/addon/godot_mcp_editor/$file"
         $dest = "$addonPath/$file"
 
-        Write-Host "  Downloading $file..." -ForegroundColor Gray
-        if (-not (Download-File $url $dest)) {
-            Write-Host "  Failed to download $file" -ForegroundColor Red
+        if ($FromLocal -ne "") {
+            Write-Host "  Copying $file from local..." -ForegroundColor Gray
+        } else {
+            Write-Host "  Downloading $file..." -ForegroundColor Gray
+        }
+        if (-not (Fetch-AddonFile "godot_mcp_editor/$file" $dest)) {
+            Write-Host "  Failed to fetch $file" -ForegroundColor Red
             $success = $false
         }
     }

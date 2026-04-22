@@ -17,6 +17,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 REPO_URL="https://raw.githubusercontent.com/HaD0Yun/Gopeak-godot-mcp/main"
+FROM_LOCAL=""
 
 AUTO_RELOAD_ONLY=false
 RUNTIME_ONLY=false
@@ -32,6 +33,18 @@ while [[ $# -gt 0 ]]; do
             RUNTIME_ONLY=true
             shift
             ;;
+        --from-local)
+            if [ -z "${2:-}" ]; then
+                echo -e "${RED}ERROR: --from-local requires a path to a local gopeak-godot-mcp checkout${NC}"
+                exit 1
+            fi
+            FROM_LOCAL="$2"
+            shift 2
+            ;;
+        --from-local=*)
+            FROM_LOCAL="${1#*=}"
+            shift
+            ;;
         -f|--force)
             FORCE=true
             shift
@@ -44,6 +57,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --auto-reload-only    Install only Auto Reload addon"
             echo "  --runtime-only        Install only Runtime addon"
+            echo "  --from-local <path>   Copy from a local gopeak-godot-mcp checkout"
+            echo "                        (useful for testing fork edits without pushing)"
             echo "  -f, --force           Overwrite existing addons"
             echo "  -h, --help            Show this help message"
             echo ""
@@ -56,6 +71,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ -n "$FROM_LOCAL" ]; then
+    if [ ! -d "$FROM_LOCAL/src/addon" ]; then
+        echo -e "${RED}ERROR: --from-local path does not contain src/addon/${NC}"
+        echo -e "${YELLOW}Expected: $FROM_LOCAL/src/addon/${NC}"
+        exit 1
+    fi
+    for required_dir in auto_reload godot_mcp_editor godot_mcp_runtime; do
+        if [ ! -d "$FROM_LOCAL/src/addon/$required_dir" ]; then
+            echo -e "${RED}ERROR: --from-local path missing $required_dir${NC}"
+            echo -e "${YELLOW}Expected: $FROM_LOCAL/src/addon/$required_dir${NC}"
+            exit 1
+        fi
+    done
+fi
 
 echo -e "${CYAN}=====================================${NC}"
 echo -e "${CYAN}  Godot MCP Addon Installer${NC}"
@@ -75,13 +105,29 @@ if [ ! -d "addons" ]; then
     echo -e "${GREEN}[✓]${NC} Created addons/ directory"
 fi
 
+copy_from_local() {
+    local rel_path="$1"
+    local dest="$2"
+    local dir
+    dir=$(dirname "$dest")
+    mkdir -p "$dir"
+
+    local src="$FROM_LOCAL/src/addon/$rel_path"
+    if [ ! -f "$src" ]; then
+        echo -e "${RED}ERROR: local source missing: $src${NC}"
+        return 1
+    fi
+    cp -f "$src" "$dest"
+}
+
 download_file() {
     local url="$1"
     local dest="$2"
-    local dir=$(dirname "$dest")
-    
+    local dir
+    dir=$(dirname "$dest")
+
     mkdir -p "$dir"
-    
+
     if command -v curl &> /dev/null; then
         curl -sL "$url" -o "$dest"
     elif command -v wget &> /dev/null; then
@@ -89,6 +135,18 @@ download_file() {
     else
         echo -e "${RED}ERROR: Neither curl nor wget found. Please install one of them.${NC}"
         exit 1
+    fi
+}
+
+fetch_addon_file() {
+    # rel_path is the path inside src/addon/ (e.g. "auto_reload/auto_reload.gd")
+    local rel_path="$1"
+    local dest="$2"
+
+    if [ -n "$FROM_LOCAL" ]; then
+        copy_from_local "$rel_path" "$dest"
+    else
+        download_file "$REPO_URL/src/addon/$rel_path" "$dest"
     fi
 }
 
@@ -113,13 +171,17 @@ install_auto_reload() {
     local success=true
     
     for file in "${files[@]}"; do
-        echo -e "  Downloading $file..."
-        if ! download_file "$REPO_URL/src/addon/auto_reload/$file" "$addon_path/$file"; then
-            echo -e "  ${RED}Failed to download $file${NC}"
+        if [ -n "$FROM_LOCAL" ]; then
+            echo -e "  Copying $file from local..."
+        else
+            echo -e "  Downloading $file..."
+        fi
+        if ! fetch_addon_file "auto_reload/$file" "$addon_path/$file"; then
+            echo -e "  ${RED}Failed to fetch $file${NC}"
             success=false
         fi
     done
-    
+
     if [ "$success" = true ]; then
         echo -e "${GREEN}[✓]${NC} Auto Reload addon installed successfully!"
         return 0
@@ -148,13 +210,17 @@ install_runtime() {
     local success=true
     
     for file in "${files[@]}"; do
-        echo -e "  Downloading $file..."
-        if ! download_file "$REPO_URL/src/addon/godot_mcp_runtime/$file" "$addon_path/$file"; then
-            echo -e "  ${RED}Failed to download $file${NC}"
+        if [ -n "$FROM_LOCAL" ]; then
+            echo -e "  Copying $file from local..."
+        else
+            echo -e "  Downloading $file..."
+        fi
+        if ! fetch_addon_file "godot_mcp_runtime/$file" "$addon_path/$file"; then
+            echo -e "  ${RED}Failed to fetch $file${NC}"
             success=false
         fi
     done
-    
+
     if [ "$success" = true ]; then
         echo -e "${GREEN}[✓]${NC} Runtime addon installed successfully!"
         return 0
@@ -191,9 +257,13 @@ install_editor_plugin() {
     local success=true
 
     for file in "${files[@]}"; do
-        echo -e "  Downloading $file..."
-        if ! download_file "$REPO_URL/src/addon/godot_mcp_editor/$file" "$addon_path/$file"; then
-            echo -e "  ${RED}Failed to download $file${NC}"
+        if [ -n "$FROM_LOCAL" ]; then
+            echo -e "  Copying $file from local..."
+        else
+            echo -e "  Downloading $file..."
+        fi
+        if ! fetch_addon_file "godot_mcp_editor/$file" "$addon_path/$file"; then
+            echo -e "  ${RED}Failed to fetch $file${NC}"
             success=false
         fi
     done
