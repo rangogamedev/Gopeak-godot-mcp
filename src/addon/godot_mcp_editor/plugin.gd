@@ -3,12 +3,17 @@ extends EditorPlugin
 
 const MCPEditorClientScript = preload("mcp_client.gd")
 const MCPToolExecutorScript = preload("tool_executor.gd")
+const McpDapRelayScript = preload("dap_relay.gd")
 
 const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
+const SETTING_DAP_RELAY_ENABLED := "mcp/editor/dap_relay_enabled"
+const SETTING_DAP_RELAY_PORT := "mcp/editor/dap_relay_port"
+const DAP_RELAY_DEFAULT_PORT := 6016
 
 var _mcp_client: Node
 var _tool_executor: Node
+var _dap_relay: Node
 var _status_label: Label
 
 
@@ -23,6 +28,8 @@ func _enter_tree() -> void:
 	_tool_executor.name = "MCPToolExecutor"
 	add_child(_tool_executor)
 	_tool_executor.set_editor_plugin(self)
+
+	_spawn_dap_relay_if_enabled()
 
 	_mcp_client.connected.connect(_on_connected)
 	_mcp_client.disconnected.connect(_on_disconnected)
@@ -47,6 +54,10 @@ func _exit_tree() -> void:
 	if _tool_executor:
 		_tool_executor.queue_free()
 		_tool_executor = null
+
+	if _dap_relay:
+		_dap_relay.queue_free()
+		_dap_relay = null
 
 	if _status_label:
 		remove_control_from_container(CONTAINER_TOOLBAR, _status_label)
@@ -97,6 +108,39 @@ func _register_project_settings() -> void:
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,65535,1",
 	})
+
+	# DAP relay — bridges the engine's hardcoded `127.0.0.1:6006` to
+	# `0.0.0.0:<dap_relay_port>` so WSL clients can reach it without
+	# a `netsh portproxy` rule. Opt-in per project.
+	if not ProjectSettings.has_setting(SETTING_DAP_RELAY_ENABLED):
+		ProjectSettings.set_setting(SETTING_DAP_RELAY_ENABLED, false)
+	ProjectSettings.set_initial_value(SETTING_DAP_RELAY_ENABLED, false)
+	ProjectSettings.add_property_info({
+		"name": SETTING_DAP_RELAY_ENABLED,
+		"type": TYPE_BOOL,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "Expose the Godot DAP server on 0.0.0.0:<dap_relay_port> via an in-editor TCP relay (WSL→Windows Godot workaround).",
+	})
+
+	if not ProjectSettings.has_setting(SETTING_DAP_RELAY_PORT):
+		ProjectSettings.set_setting(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT)
+	ProjectSettings.set_initial_value(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT)
+	ProjectSettings.add_property_info({
+		"name": SETTING_DAP_RELAY_PORT,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1024,65535,1",
+	})
+
+
+func _spawn_dap_relay_if_enabled() -> void:
+	var enabled: bool = ProjectSettings.get_setting(SETTING_DAP_RELAY_ENABLED, false)
+	if not enabled:
+		return
+	var port: int = int(ProjectSettings.get_setting(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT))
+	_dap_relay = McpDapRelayScript.new(port)
+	_dap_relay.name = "MCPDapRelay"
+	add_child(_dap_relay)
 
 
 func _on_tool_requested(request_id: String, tool_name: String, args: Dictionary) -> void:

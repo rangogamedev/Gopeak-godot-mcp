@@ -196,6 +196,36 @@ export function resolveDefaultRuntimeHost(): string {
 }
 
 /**
+ * Resolve the TCP port the MCP server should use when connecting to the
+ * Godot DAP server. Engine binds `127.0.0.1:6006` hardcoded; the editor
+ * addon's `McpDapRelay` exposes it on `0.0.0.0:<relay_port>` (default
+ * 6016) so WSL clients can reach it without a `netsh portproxy` rule.
+ *
+ * Resolution order:
+ *   1. `GOPEAK_DAP_PORT` / `GODOT_DAP_PORT` / `MCP_DAP_PORT` env override
+ *   2. `6006` default (upstream engine port; used when the relay is
+ *      disabled or running on the same host).
+ *
+ * Returning a relay port here assumes the user has flipped
+ * `mcp/editor/dap_relay_enabled` in Project Settings and restarted the
+ * Godot editor. This helper does not read `project.godot` itself —
+ * keeping it pure so it unit-tests with the rest of `wsl_interop.ts`.
+ */
+export function resolveDefaultDAPPort(): number {
+  const envValue =
+    process.env.GOPEAK_DAP_PORT ||
+    process.env.GODOT_DAP_PORT ||
+    process.env.MCP_DAP_PORT;
+  if (envValue) {
+    const parsed = Number.parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+      return parsed;
+    }
+  }
+  return 6006;
+}
+
+/**
  * Normalize a path for cross-platform equality comparison. Handles the
  * WSL↔Windows case where Godot LSP responses arrive as `file:///C:/...` but
  * local filesystem resolution produces `/mnt/c/...`.

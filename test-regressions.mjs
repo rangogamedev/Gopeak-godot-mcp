@@ -18,6 +18,7 @@ import {
   resolveWSLWindowsTempDir,
   resolveWindowsHostIp,
   resolveDefaultRuntimeHost,
+  resolveDefaultDAPPort,
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
@@ -378,6 +379,47 @@ function testWSLInterop() {
       process.env.GODOT_PATH = prevGodotPath;
     }
     __resetWindowsHostIpCacheForTests();
+  }
+
+  // resolveDefaultDAPPort — env override + fallback
+  const prevDapPortEnvs = {
+    GOPEAK_DAP_PORT: process.env.GOPEAK_DAP_PORT,
+    GODOT_DAP_PORT: process.env.GODOT_DAP_PORT,
+    MCP_DAP_PORT: process.env.MCP_DAP_PORT,
+  };
+  try {
+    for (const key of Object.keys(prevDapPortEnvs)) {
+      delete process.env[key];
+    }
+    assert.equal(resolveDefaultDAPPort(), 6006, 'DAP port defaults to 6006 with no env');
+
+    process.env.GOPEAK_DAP_PORT = '6016';
+    assert.equal(resolveDefaultDAPPort(), 6016, 'GOPEAK_DAP_PORT env override honored');
+    delete process.env.GOPEAK_DAP_PORT;
+
+    process.env.GODOT_DAP_PORT = '7016';
+    assert.equal(resolveDefaultDAPPort(), 7016, 'GODOT_DAP_PORT env override honored');
+    delete process.env.GODOT_DAP_PORT;
+
+    process.env.MCP_DAP_PORT = '8016';
+    assert.equal(resolveDefaultDAPPort(), 8016, 'MCP_DAP_PORT env override honored');
+    delete process.env.MCP_DAP_PORT;
+
+    process.env.GOPEAK_DAP_PORT = 'not-a-number';
+    assert.equal(resolveDefaultDAPPort(), 6006, 'invalid DAP port env falls back to 6006');
+    delete process.env.GOPEAK_DAP_PORT;
+
+    process.env.GOPEAK_DAP_PORT = '99999';
+    assert.equal(resolveDefaultDAPPort(), 6006, 'out-of-range DAP port env falls back to 6006');
+    delete process.env.GOPEAK_DAP_PORT;
+  } finally {
+    for (const [key, value] of Object.entries(prevDapPortEnvs)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
   }
 
   // normalizePathForCrossPlatformComparison
