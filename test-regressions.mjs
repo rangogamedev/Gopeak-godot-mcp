@@ -17,6 +17,7 @@ import {
   ensureWSLWindowsProjectPath,
   resolveWSLWindowsTempDir,
   resolveWindowsHostIp,
+  resolveDefaultRuntimeHost,
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
@@ -338,6 +339,43 @@ function testWSLInterop() {
       delete process.env.WSL_HOST_IP;
     } else {
       process.env.WSL_HOST_IP = prevWslHostIp;
+    }
+    __resetWindowsHostIpCacheForTests();
+  }
+
+  // resolveDefaultRuntimeHost — env override path
+  __resetWindowsHostIpCacheForTests();
+  const prevRuntimeHost = process.env.GOPEAK_RUNTIME_HOST;
+  process.env.GOPEAK_RUNTIME_HOST = '10.0.0.42';
+  try {
+    assert.equal(
+      resolveDefaultRuntimeHost(),
+      '10.0.0.42',
+      'GOPEAK_RUNTIME_HOST env override honored'
+    );
+  } finally {
+    if (prevRuntimeHost === undefined) {
+      delete process.env.GOPEAK_RUNTIME_HOST;
+    } else {
+      process.env.GOPEAK_RUNTIME_HOST = prevRuntimeHost;
+    }
+    __resetWindowsHostIpCacheForTests();
+  }
+  // Without env + Linux godot path (forces wsl_linux / native mode) → loopback.
+  __resetWindowsHostIpCacheForTests();
+  const prevGodotPath = process.env.GODOT_PATH;
+  process.env.GODOT_PATH = '/usr/bin/godot';
+  try {
+    assert.equal(
+      resolveDefaultRuntimeHost(),
+      '127.0.0.1',
+      'runtime host falls back to 127.0.0.1 when no env + non-Windows target'
+    );
+  } finally {
+    if (prevGodotPath === undefined) {
+      delete process.env.GODOT_PATH;
+    } else {
+      process.env.GODOT_PATH = prevGodotPath;
     }
     __resetWindowsHostIpCacheForTests();
   }

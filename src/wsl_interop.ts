@@ -10,6 +10,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { normalize } from 'path';
 import { release } from 'os';
+import { execSync } from 'child_process';
 
 import type { WSLInteropDetails } from './server-types.js';
 
@@ -108,13 +109,17 @@ let cachedWindowsHostIp: string | null | undefined;
 
 /**
  * Resolve the Windows host IP reachable from WSL2. Used to connect to
- * Windows-side services (LSP 6005, DAP 6006) that bind to the Windows
- * loopback.
+ * Windows-side services (LSP 6005, DAP 6006, runtime 7777) that bind to
+ * the Windows loopback or the `vEthernet (WSL)` adapter.
  *
  * Resolution order:
- *   1. WSL_HOST_IP env (explicit override)
- *   2. `nameserver` entry in /etc/resolv.conf (WSL2 default — the Windows
- *      host exposes itself as the DNS resolver)
+ *   1. `WSL_HOST_IP` env (explicit override)
+ *   2. Default gateway from `ip route show default` — the Windows-side
+ *      vEthernet (WSL) adapter IP. Works in modern WSL2 NAT mode where
+ *      `/etc/resolv.conf` lists a DNS-only forwarder (e.g.
+ *      `10.255.255.254`) that is NOT a TCP route to the host.
+ *   3. `nameserver` entry in `/etc/resolv.conf` (legacy WSL2 default
+ *      where the DNS forwarder happens to equal the host IP).
  *
  * Result cached for process lifetime. Returns `null` when nothing resolved.
  */
@@ -127,6 +132,21 @@ export function resolveWindowsHostIp(): string | null {
   if (envOverride) {
     cachedWindowsHostIp = envOverride;
     return envOverride;
+  }
+
+  try {
+    const routeOutput = execSync('ip route show default', {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: 500,
+    });
+    const match = routeOutput.match(/^default\s+via\s+(\S+)/m);
+    if (match) {
+      cachedWindowsHostIp = match[1];
+      return match[1];
+    }
+  } catch {
+    // fall through to resolv.conf
   }
 
   try {
@@ -147,6 +167,32 @@ export function resolveWindowsHostIp(): string | null {
 // Exported for tests that want to reset the memoized host IP.
 export function __resetWindowsHostIpCacheForTests(): void {
   cachedWindowsHostIp = undefined;
+}
+
+/**
+ * Resolve the host the MCP server should use when connecting to the Godot
+ * runtime autoload TCP server (default port 7777). Mirrors the
+ * LSP/DAP pattern: explicit env override → WSL→Windows auto-detect →
+ * `127.0.0.1`.
+ */
+export function resolveDefaultRuntimeHost(): string {
+  const envOverride =
+    process.env.GOPEAK_RUNTIME_HOST ||
+    process.env.GODOT_RUNTIME_HOST ||
+    process.env.MCP_RUNTIME_HOST;
+  if (envOverride) {
+    return envOverride;
+  }
+
+  const interop = getWSLInteropDetails(process.env.GODOT_PATH ?? null);
+  if (interop.mode === 'wsl_windows') {
+    const winHost = resolveWindowsHostIp();
+    if (winHost) {
+      return winHost;
+    }
+  }
+
+  return '127.0.0.1';
 }
 
 /**

@@ -37,6 +37,7 @@ import {
   translatePathForGodot as wslTranslatePathForGodot,
   resolveWSLWindowsTempDir,
   resolveWindowsHostIp,
+  resolveDefaultRuntimeHost,
 } from './wsl_interop.js';
 import { mapProject } from './gdscript_parser.js';
 import { serveVisualization, setProjectPath, stopVisualizationServer } from './visualizer-server.js';
@@ -674,7 +675,7 @@ class GodotServer {
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
     const RUNTIME_PORT = 7777;
-    const RUNTIME_HOST = '127.0.0.1';
+    const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const TIMEOUT_MS = 10000;
 
     return new Promise((resolve) => {
