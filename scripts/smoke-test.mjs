@@ -94,8 +94,30 @@ async function main() {
   const PROMPTS_LIST_ID = 2;
   const TOOLS_LIST_ID = 3;
 
+  // Cold-start budget — see scripts/smoke-test.mjs comment block below.
+  // On WSL targeting a Windows Godot exe, the first JSON-RPC response
+  // can take 10-12s because libuv holds child stderr until stdin
+  // activity and Windows binfmt_misc + Defender scanning stretch the
+  // initial `execFileAsync(godot, --version)`. On native-Linux CI it
+  // clears in well under a second. A 20s per-response cap covers both.
+  const RESPONSE_TIMEOUT_MS = Number.parseInt(process.env.GOPEAK_SMOKE_RESPONSE_TIMEOUT_MS ?? '', 10) || 20000;
+  const POLL_INTERVAL_MS = 100;
+
+  const waitForResponse = async (id, label) => {
+    const deadline = Date.now() + RESPONSE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (server.exitCode !== null) {
+        throw new Error(`server exited early while waiting for ${label}: ${stderr || '(no stderr)'}`);
+      }
+      const found = findJsonRpcResponse(stdout, id);
+      if (found) return found;
+      await delay(POLL_INTERVAL_MS);
+    }
+    throw new Error(`missing ${label} response (waited ${RESPONSE_TIMEOUT_MS}ms)`);
+  };
+
   try {
-    await delay(2000);
+    await delay(500);
     if (server.exitCode !== null) {
       throw new Error(`server exited early: ${stderr || '(no stderr)'}`);
     }
@@ -112,11 +134,7 @@ async function main() {
       },
     });
 
-    await delay(1000);
-    const init = findJsonRpcResponse(stdout, 1);
-    if (!init) {
-      throw new Error('missing initialize response');
-    }
+    const init = await waitForResponse(1, 'initialize');
     if (!init.result?.capabilities?.prompts) {
       throw new Error('missing prompts capability');
     }
@@ -124,19 +142,17 @@ async function main() {
     stdout = '';
     send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     send({ jsonrpc: '2.0', id: PROMPTS_LIST_ID, method: 'prompts/list', params: {} });
-    await delay(1000);
 
-    const prompts = findJsonRpcResponse(stdout, PROMPTS_LIST_ID);
-    if (!prompts || prompts.result.prompts.length < 2) {
+    const prompts = await waitForResponse(PROMPTS_LIST_ID, 'prompts/list');
+    if (!prompts.result.prompts || prompts.result.prompts.length < 2) {
       throw new Error('missing prompts/list response');
     }
 
     stdout = '';
     send({ jsonrpc: '2.0', id: TOOLS_LIST_ID, method: 'tools/list', params: {} });
 
-    await delay(1500);
-    const tools = findJsonRpcResponse(stdout, TOOLS_LIST_ID);
-    if (!tools || tools.result.tools.length === 0) {
+    const tools = await waitForResponse(TOOLS_LIST_ID, 'tools/list');
+    if (!tools.result.tools || tools.result.tools.length === 0) {
       throw new Error('missing tools/list response');
     }
     const invalidToolNames = tools.result.tools
