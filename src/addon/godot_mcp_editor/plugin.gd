@@ -18,7 +18,9 @@ var _status_label: Label
 
 
 func _enter_tree() -> void:
+	_plugin_log("enter_tree_start")
 	_register_project_settings()
+	_plugin_log("project_settings_registered")
 
 	_mcp_client = MCPEditorClientScript.new()
 	_mcp_client.name = "MCPEditorClient"
@@ -36,7 +38,25 @@ func _enter_tree() -> void:
 	_mcp_client.tool_requested.connect(_on_tool_requested)
 
 	_setup_status_indicator()
+	_plugin_log("about_to_connect")
 	_mcp_client.connect_to_server()
+	_plugin_log("enter_tree_end")
+
+
+func _plugin_log(kind: String) -> void:
+	var line := "[%s] level=INFO source=plugin kind=%s" % [
+		Time.get_datetime_string_from_system(true),
+		kind,
+	]
+	print(line)
+	var f := FileAccess.open("user://mcp_editor_client.log", FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open("user://mcp_editor_client.log", FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line(line)
+	f.close()
 
 
 func _exit_tree() -> void:
