@@ -13,6 +13,7 @@ const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
 const RECONNECT_DELAY := 3.0
 const MAX_RECONNECT_DELAY := 30.0
+const LOG_PATH := "user://mcp_editor_client.log"
 
 var socket: WebSocketPeer = WebSocketPeer.new()
 var server_url: String = DEFAULT_URL
@@ -34,6 +35,32 @@ func _ready() -> void:
 
 	set_process(true)
 	_initialized = true
+	_log("INFO", "ready", "project_path=%s" % _project_path)
+
+
+# File logging — writes a single line per state change to
+# `user://mcp_editor_client.log`. Under WSL, `user://` resolves to
+# `%APPDATA%\Godot\app_userdata\<project>\logs\` which is tailable
+# from the Linux side via `/mnt/c/Users/.../app_userdata/.../logs/`.
+# Godot editor does not produce its own log file (only child project
+# runs do) so this is the only reliable way to observe plugin state
+# when the editor is running on Windows and Claude Code on WSL.
+static func _log(level: String, kind: String, detail: String = "") -> void:
+	var line := "[%s] level=%s source=mcp_client kind=%s %s" % [
+		Time.get_datetime_string_from_system(true),
+		level,
+		kind,
+		detail,
+	]
+	print(line)
+	var f := FileAccess.open(LOG_PATH, FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open(LOG_PATH, FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line(line)
+	f.close()
 
 
 func _process(_delta: float) -> void:
@@ -121,11 +148,13 @@ func disconnect_from_server() -> void:
 
 
 func _attempt_connection() -> void:
+	_log("INFO", "attempt", "url=%s" % server_url)
 	if socket.get_ready_state() != WebSocketPeer.STATE_CLOSED:
 		socket.close()
 
 	var err := socket.connect_to_url(server_url)
 	if err != OK:
+		_log("ERROR", "connect_to_url_failed", "url=%s err=%d" % [server_url, err])
 		push_error("[MCP Editor] Failed to connect: %s" % err)
 		_schedule_reconnect()
 
@@ -139,11 +168,15 @@ func _handle_connect() -> void:
 		"project_path": _project_path
 	})
 
+	_log("INFO", "connect", "url=%s" % server_url)
 	connected.emit()
 
 
 func _handle_disconnect() -> void:
 	_is_connected = false
+	var close_code := socket.get_close_code()
+	var close_reason := socket.get_close_reason()
+	_log("INFO", "disconnect", "code=%d reason=%s" % [close_code, close_reason])
 	disconnected.emit()
 
 	if _should_reconnect:
@@ -152,12 +185,15 @@ func _handle_disconnect() -> void:
 
 func _schedule_reconnect() -> void:
 	if _reconnect_timer == null:
+		_log("ERROR", "reconnect_timer_null", "cannot schedule reconnect")
 		return
+	_log("INFO", "backoff", "delay=%.1f next=%.1f" % [_current_reconnect_delay, min(_current_reconnect_delay * 2.0, MAX_RECONNECT_DELAY)])
 	_reconnect_timer.start(_current_reconnect_delay)
 	_current_reconnect_delay = min(_current_reconnect_delay * 2.0, MAX_RECONNECT_DELAY)
 
 
 func _on_reconnect_timer() -> void:
+	_log("INFO", "reconnect_timer_fired", "")
 	_attempt_connection()
 
 

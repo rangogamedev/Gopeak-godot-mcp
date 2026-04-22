@@ -14,10 +14,29 @@ const DEFAULT_LISTEN_PORT := 6016
 const TARGET_HOST := "127.0.0.1"
 const TARGET_PORT := 6006
 const MAX_CHUNK_BYTES := 65536
+const LOG_PATH := "user://mcp_editor_client.log"
 
 var _listen_port: int
 var _server: TCPServer
 var _pairs: Array[Dictionary] = []
+
+
+static func _log(level: String, kind: String, detail: String = "") -> void:
+	var line := "[%s] level=%s source=dap_relay kind=%s %s" % [
+		Time.get_datetime_string_from_system(true),
+		level,
+		kind,
+		detail,
+	]
+	print(line)
+	var f := FileAccess.open(LOG_PATH, FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open(LOG_PATH, FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line(line)
+	f.close()
 
 
 func _init(listen_port: int = DEFAULT_LISTEN_PORT) -> void:
@@ -28,10 +47,11 @@ func _ready() -> void:
 	_server = TCPServer.new()
 	var err: int = _server.listen(_listen_port, "0.0.0.0")
 	if err != OK:
+		_log("ERROR", "listen_failed", "port=%d err=%d" % [_listen_port, err])
 		push_error("[dap_relay] failed to listen on 0.0.0.0:%d (error %d)" % [_listen_port, err])
 		_server = null
 		return
-	print("[dap_relay] listening on 0.0.0.0:%d → %s:%d" % [_listen_port, TARGET_HOST, TARGET_PORT])
+	_log("INFO", "listening", "bind=0.0.0.0:%d target=%s:%d" % [_listen_port, TARGET_HOST, TARGET_PORT])
 
 
 func _exit_tree() -> void:
@@ -41,6 +61,7 @@ func _exit_tree() -> void:
 	for pair: Dictionary in _pairs:
 		_close_pair(pair)
 	_pairs.clear()
+	_log("INFO", "shutdown", "")
 
 
 func _process(_delta: float) -> void:
@@ -66,11 +87,12 @@ func _accept_new_connection() -> void:
 	var upstream: StreamPeerTCP = StreamPeerTCP.new()
 	var err: int = upstream.connect_to_host(TARGET_HOST, TARGET_PORT)
 	if err != OK:
+		_log("WARN", "upstream_connect_failed", "err=%d target=%s:%d" % [err, TARGET_HOST, TARGET_PORT])
 		push_warning("[dap_relay] upstream connect_to_host failed (error %d) — dropping client" % err)
 		client.disconnect_from_host()
 		return
 	_pairs.append({ "client": client, "upstream": upstream })
-	print_verbose("[dap_relay] new connection paired (total=%d)" % _pairs.size())
+	_log("INFO", "accept", "pairs=%d" % _pairs.size())
 
 
 func _tick_pair(pair: Dictionary) -> bool:
