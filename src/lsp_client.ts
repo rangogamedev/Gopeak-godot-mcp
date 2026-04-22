@@ -3,6 +3,32 @@ import { createConnection, type Socket } from 'node:net';
 import { dirname, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import {
+  getWSLInteropDetails,
+  normalizePathForCrossPlatformComparison,
+  resolveWindowsHostIp,
+} from './wsl_interop.js';
+
+function resolveDefaultLSPHost(): string {
+  const envOverride =
+    process.env.GOPEAK_LSP_HOST ||
+    process.env.GODOT_LSP_HOST ||
+    process.env.MCP_LSP_HOST;
+  if (envOverride) {
+    return envOverride;
+  }
+
+  const interop = getWSLInteropDetails(process.env.GODOT_PATH ?? null);
+  if (interop.mode === 'wsl_windows') {
+    const winHost = resolveWindowsHostIp();
+    if (winHost) {
+      return winHost;
+    }
+  }
+
+  return '127.0.0.1';
+}
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
@@ -31,9 +57,9 @@ export class GodotLSPClient {
   private diagnosticsWaiters: Map<string, DiagnosticsWaiter> = new Map();
   private documentVersions: Map<string, number> = new Map();
 
-  constructor(port: number = 6005, host: string = '127.0.0.1') {
+  constructor(port: number = 6005, host?: string) {
     this.port = port;
-    this.host = host;
+    this.host = host ?? resolveDefaultLSPHost();
     this.pendingRequests = new Map<number, PendingRequest>();
   }
 
@@ -556,6 +582,12 @@ function normalizeLSPError(error: unknown): string {
 }
 
 function normalizePathForComparison(pathValue: string): string {
+  const interop = getWSLInteropDetails(process.env.GODOT_PATH ?? null);
+  if (interop.isWSL) {
+    // LSP responses from Windows Godot arrive as `file:///C:/...` or `C:\...`;
+    // fold both sides to the WSL mounted form for equality checks.
+    return normalizePathForCrossPlatformComparison(resolve(pathValue));
+  }
   const resolved = resolve(pathValue);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
@@ -563,7 +595,11 @@ function normalizePathForComparison(pathValue: string): string {
 function isPathWithinRoot(rootPath: string, candidatePath: string): boolean {
   const normalizedRoot = normalizePathForComparison(rootPath);
   const normalizedCandidate = normalizePathForComparison(candidatePath);
-  const rootPrefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
+  // On WSL-normalized paths the separator is always `/`; on other platforms
+  // fall back to the platform sep.
+  const interop = getWSLInteropDetails(process.env.GODOT_PATH ?? null);
+  const separator = interop.isWSL ? '/' : sep;
+  const rootPrefix = normalizedRoot.endsWith(separator) ? normalizedRoot : `${normalizedRoot}${separator}`;
 
   return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(rootPrefix);
 }

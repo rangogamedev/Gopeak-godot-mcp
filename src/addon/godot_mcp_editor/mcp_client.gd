@@ -6,7 +6,11 @@ signal connected
 signal disconnected
 signal tool_requested(request_id: String, tool_name: String, args: Dictionary)
 
-const DEFAULT_URL := "ws://127.0.0.1:6505/godot"
+const DEFAULT_URL := "ws://localhost:6505/godot"
+const DEFAULT_HOST := "localhost"
+const DEFAULT_PORT := 6505
+const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
+const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
 const RECONNECT_DELAY := 3.0
 const MAX_RECONNECT_DELAY := 30.0
 
@@ -71,17 +75,40 @@ func _resolve_server_url(explicit_url: String) -> String:
 	if explicit_url != "":
 		return explicit_url
 
-	var env_keys := ["GODOT_BRIDGE_PORT", "MCP_BRIDGE_PORT", "GOPEAK_BRIDGE_PORT"]
-	for key in env_keys:
-		var raw := OS.get_environment(key)
-		if raw == "":
-			continue
-		if raw.is_valid_int():
-			var port := int(raw)
-			if port >= 1 and port <= 65535:
-				return "ws://127.0.0.1:%d/godot" % port
+	# Resolution order: ProjectSettings override → env override → default.
+	# ProjectSettings is the designer-facing knob visible in Project Settings UI;
+	# env vars remain as a non-editor override layer (CI, headless, ad-hoc).
+	var host := DEFAULT_HOST
+	if ProjectSettings.has_setting(SETTING_BRIDGE_HOST):
+		var setting_host := str(ProjectSettings.get_setting(SETTING_BRIDGE_HOST)).strip_edges()
+		if setting_host != "":
+			host = setting_host
 
-	return DEFAULT_URL
+	var host_keys := ["GODOT_BRIDGE_HOST", "MCP_BRIDGE_HOST", "GOPEAK_BRIDGE_HOST"]
+	for key in host_keys:
+		var raw_host := OS.get_environment(key)
+		if raw_host.strip_edges() != "":
+			host = raw_host.strip_edges()
+			break
+
+	var port := DEFAULT_PORT
+	if ProjectSettings.has_setting(SETTING_BRIDGE_PORT):
+		var setting_port := int(ProjectSettings.get_setting(SETTING_BRIDGE_PORT))
+		if setting_port >= 1 and setting_port <= 65535:
+			port = setting_port
+
+	var port_keys := ["GODOT_BRIDGE_PORT", "MCP_BRIDGE_PORT", "GOPEAK_BRIDGE_PORT"]
+	for key in port_keys:
+		var raw_port := OS.get_environment(key)
+		if raw_port == "":
+			continue
+		if raw_port.is_valid_int():
+			var parsed_port := int(raw_port)
+			if parsed_port >= 1 and parsed_port <= 65535:
+				port = parsed_port
+				break
+
+	return "ws://%s:%d/godot" % [host, port]
 
 
 func disconnect_from_server() -> void:

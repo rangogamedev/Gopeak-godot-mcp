@@ -9,6 +9,18 @@ import { spawn } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createBridge } from './build/godot-bridge.js';
+import {
+  getWSLInteropDetails,
+  convertMountedPathToWindows,
+  convertWindowsPathToMounted,
+  translatePathForGodot,
+  ensureWSLWindowsProjectPath,
+  resolveWSLWindowsTempDir,
+  resolveWindowsHostIp,
+  resolveDefaultRuntimeHost,
+  normalizePathForCrossPlatformComparison,
+  __resetWindowsHostIpCacheForTests,
+} from './build/wsl_interop.js';
 
 const INDEX_SOURCE = readFileSync(new URL('./src/index.ts', import.meta.url), 'utf8');
 const OPERATIONS_SOURCE = readFileSync(new URL('./src/scripts/godot_operations.gd', import.meta.url), 'utf8');
@@ -209,8 +221,193 @@ async function testEditorStatusPortConflict() {
   });
 }
 
+function testWSLInterop() {
+  // convertMountedPathToWindows
+  assert.equal(
+    convertMountedPathToWindows('/mnt/c/Users/alice/proj'),
+    'C:\\Users\\alice\\proj',
+    'basic /mnt/c path translation'
+  );
+  assert.equal(
+    convertMountedPathToWindows('/mnt/d/foo bar/baz'),
+    'D:\\foo bar\\baz',
+    'spaces preserved in path translation'
+  );
+  assert.equal(
+    convertMountedPathToWindows('/mnt/C/WithCaps'),
+    'C:\\WithCaps',
+    'lowercase drive letter tolerated'
+  );
+  assert.equal(
+    convertMountedPathToWindows('/home/user/proj'),
+    null,
+    'non-mounted path returns null'
+  );
+  assert.equal(
+    convertMountedPathToWindows('/tmp/x'),
+    null,
+    '/tmp returns null'
+  );
+
+  // convertWindowsPathToMounted (the new inverse)
+  assert.equal(
+    convertWindowsPathToMounted('C:\\Users\\alice\\proj'),
+    '/mnt/c/Users/alice/proj',
+    'basic Windows→mounted translation'
+  );
+  assert.equal(
+    convertWindowsPathToMounted('D:/foo/bar'),
+    '/mnt/d/foo/bar',
+    'forward-slash Windows path accepted'
+  );
+  assert.equal(
+    convertWindowsPathToMounted('file:///C:/Users/alice/proj/foo.gd'),
+    '/mnt/c/Users/alice/proj/foo.gd',
+    'file:// URI translated'
+  );
+  assert.equal(
+    convertWindowsPathToMounted('/home/user/x'),
+    null,
+    'non-Windows path returns null'
+  );
+
+  // ensureWSLWindowsProjectPath
+  assert.throws(
+    () => ensureWSLWindowsProjectPath('/home/user/proj'),
+    /Windows Godot from WSL requires the project to live on \/mnt\/<drive>\//,
+    'non-mounted project path throws with actionable message'
+  );
+  // mounted path should not throw
+  ensureWSLWindowsProjectPath('/mnt/c/Users/alice/proj');
+
+  // translatePathForGodot
+  const nativeDetails = { isWSL: false, windowsTarget: false, mode: 'native' };
+  assert.equal(
+    translatePathForGodot('/home/user/x', nativeDetails, 'test'),
+    '/home/user/x',
+    'native mode passes path through unchanged'
+  );
+  const wslWindowsDetails = { isWSL: true, windowsTarget: true, mode: 'wsl_windows' };
+  assert.equal(
+    translatePathForGodot('/mnt/c/Users/alice/x', wslWindowsDetails, 'test'),
+    'C:\\Users\\alice\\x',
+    'wsl_windows mode translates mounted path'
+  );
+  assert.throws(
+    () => translatePathForGodot('/home/user/x', wslWindowsDetails, 'script path'),
+    /script path must be on a Windows-mounted path/,
+    'wsl_windows mode rejects non-mounted path with labeled error'
+  );
+
+  // getWSLInteropDetails (surface-level shape check; actual isWSL is environmental)
+  const nativeLinuxOnWinExe = getWSLInteropDetails('C:\\Godot\\Godot.exe');
+  assert.equal(typeof nativeLinuxOnWinExe.mode, 'string', 'mode is a string');
+  assert.equal(nativeLinuxOnWinExe.windowsTarget, true, '.exe path flagged as Windows target');
+
+  const nativeLinuxOnLinuxExe = getWSLInteropDetails('/usr/bin/godot');
+  assert.equal(
+    nativeLinuxOnLinuxExe.windowsTarget,
+    false,
+    'Linux path not flagged as Windows target'
+  );
+
+  // resolveWSLWindowsTempDir — returns null when not wsl_windows
+  assert.equal(
+    resolveWSLWindowsTempDir(nativeDetails),
+    null,
+    'non-wsl_windows mode returns null'
+  );
+
+  // resolveWindowsHostIp — env override path
+  __resetWindowsHostIpCacheForTests();
+  const prevWslHostIp = process.env.WSL_HOST_IP;
+  process.env.WSL_HOST_IP = '172.16.240.1';
+  try {
+    assert.equal(
+      resolveWindowsHostIp(),
+      '172.16.240.1',
+      'WSL_HOST_IP env override honored'
+    );
+    // second call hits cache
+    assert.equal(
+      resolveWindowsHostIp(),
+      '172.16.240.1',
+      'cached value returned on second call'
+    );
+  } finally {
+    if (prevWslHostIp === undefined) {
+      delete process.env.WSL_HOST_IP;
+    } else {
+      process.env.WSL_HOST_IP = prevWslHostIp;
+    }
+    __resetWindowsHostIpCacheForTests();
+  }
+
+  // resolveDefaultRuntimeHost — env override path
+  __resetWindowsHostIpCacheForTests();
+  const prevRuntimeHost = process.env.GOPEAK_RUNTIME_HOST;
+  process.env.GOPEAK_RUNTIME_HOST = '10.0.0.42';
+  try {
+    assert.equal(
+      resolveDefaultRuntimeHost(),
+      '10.0.0.42',
+      'GOPEAK_RUNTIME_HOST env override honored'
+    );
+  } finally {
+    if (prevRuntimeHost === undefined) {
+      delete process.env.GOPEAK_RUNTIME_HOST;
+    } else {
+      process.env.GOPEAK_RUNTIME_HOST = prevRuntimeHost;
+    }
+    __resetWindowsHostIpCacheForTests();
+  }
+  // Without env + Linux godot path (forces wsl_linux / native mode) → loopback.
+  __resetWindowsHostIpCacheForTests();
+  const prevGodotPath = process.env.GODOT_PATH;
+  process.env.GODOT_PATH = '/usr/bin/godot';
+  try {
+    assert.equal(
+      resolveDefaultRuntimeHost(),
+      '127.0.0.1',
+      'runtime host falls back to 127.0.0.1 when no env + non-Windows target'
+    );
+  } finally {
+    if (prevGodotPath === undefined) {
+      delete process.env.GODOT_PATH;
+    } else {
+      process.env.GODOT_PATH = prevGodotPath;
+    }
+    __resetWindowsHostIpCacheForTests();
+  }
+
+  // normalizePathForCrossPlatformComparison
+  assert.equal(
+    normalizePathForCrossPlatformComparison('C:\\Users\\alice\\proj\\foo.gd'),
+    '/mnt/c/users/alice/proj/foo.gd',
+    'Windows path normalized to mounted lowercase form'
+  );
+  assert.equal(
+    normalizePathForCrossPlatformComparison('file:///C:/Users/alice/proj/foo.gd'),
+    '/mnt/c/users/alice/proj/foo.gd',
+    'file:// URI normalized to mounted lowercase form'
+  );
+  assert.equal(
+    normalizePathForCrossPlatformComparison('/mnt/c/Users/Alice/Proj/Foo.gd'),
+    '/mnt/c/users/alice/proj/foo.gd',
+    'already-mounted path case-folded'
+  );
+  assert.equal(
+    normalizePathForCrossPlatformComparison(
+      normalizePathForCrossPlatformComparison('file:///C:/Users/alice/proj/foo.gd')
+    ),
+    normalizePathForCrossPlatformComparison('/mnt/c/Users/alice/proj/foo.gd'),
+    'Windows URI and mounted path compare equal after normalize'
+  );
+}
+
 async function main() {
   testStaleDisconnectRegression();
+  testWSLInterop();
   testSceneToolsVectorRegression();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');

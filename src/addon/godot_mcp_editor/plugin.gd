@@ -4,12 +4,17 @@ extends EditorPlugin
 const MCPEditorClientScript = preload("mcp_client.gd")
 const MCPToolExecutorScript = preload("tool_executor.gd")
 
+const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
+const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
+
 var _mcp_client: Node
 var _tool_executor: Node
 var _status_label: Label
 
 
 func _enter_tree() -> void:
+	_register_project_settings()
+
 	_mcp_client = MCPEditorClientScript.new()
 	_mcp_client.name = "MCPEditorClient"
 	add_child(_mcp_client)
@@ -67,6 +72,31 @@ func _on_disconnected() -> void:
 	if _status_label:
 		_status_label.text = "MCP: Disconnected"
 		_status_label.add_theme_color_override("font_color", Color.RED)
+
+
+func _register_project_settings() -> void:
+	# Surface bridge host/port in Project Settings UI with sensible defaults.
+	# Designers can override per-project (e.g. point at the WSL host IP when
+	# Godot runs on Windows and the bridge binds on a WSL interface).
+	if not ProjectSettings.has_setting(SETTING_BRIDGE_HOST):
+		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "localhost")
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "localhost")
+	ProjectSettings.add_property_info({
+		"name": SETTING_BRIDGE_HOST,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "Host the MCP editor bridge should connect to (default: localhost).",
+	})
+
+	if not ProjectSettings.has_setting(SETTING_BRIDGE_PORT):
+		ProjectSettings.set_setting(SETTING_BRIDGE_PORT, 6505)
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_PORT, 6505)
+	ProjectSettings.add_property_info({
+		"name": SETTING_BRIDGE_PORT,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,65535,1",
+	})
 
 
 func _on_tool_requested(request_id: String, tool_name: String, args: Dictionary) -> void:

@@ -10,11 +10,10 @@
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
 import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { spawn } from 'child_process';
+import { tmpdir, release } from 'os';
+import { spawn, exec, execFile } from 'child_process';
 import { createConnection as createTcpConnection } from 'node:net';
 import { promisify } from 'util';
-import { exec } from 'child_process';
 
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -31,6 +30,15 @@ import {
 import { setupResourceHandlers } from './resources.js';
 import { GodotLSPClient, handleLSPTool } from './lsp_client.js';
 import { GodotDAPClient, handleDAPTool } from './dap_client.js';
+import {
+  getWSLInteropDetails as wslGetInteropDetails,
+  convertMountedPathToWindows as wslConvertMountedPathToWindows,
+  ensureWSLWindowsProjectPath as wslEnsureWindowsProjectPath,
+  translatePathForGodot as wslTranslatePathForGodot,
+  resolveWSLWindowsTempDir,
+  resolveWindowsHostIp,
+  resolveDefaultRuntimeHost,
+} from './wsl_interop.js';
 import { mapProject } from './gdscript_parser.js';
 import { serveVisualization, setProjectPath, stopVisualizationServer } from './visualizer-server.js';
 import { GodotBridge, getDefaultBridge } from './godot-bridge.js';
@@ -38,9 +46,17 @@ import { getPrompt, listPrompts } from './prompts.js';
 import { buildToolDefinitions as buildToolDefinitionsForServer } from './tool-definitions.js';
 import { CORE_TOOL_GROUPS, TOOL_GROUPS } from './tool-groups.js';
 import { DEBUG_MODE, GODOT_DEBUG_MODE_DEFAULT, SERVER_VERSION } from './server-version.js';
-import type { GodotProcess, GodotServerConfig, MCPToolDefinition, OperationParams } from './server-types.js';
+import type {
+  GodotProcess,
+  GodotServerConfig,
+  MCPToolDefinition,
+  OperationParams,
+  PreparedGodotCommand,
+  WSLInteropDetails,
+} from './server-types.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -328,9 +344,7 @@ class GodotServer {
         return false;
       }
 
-      // Try to execute Godot with --version flag
-      const command = path === 'godot' ? 'godot --version' : `"${path}" --version`;
-      await execAsync(command);
+      await execFileAsync(path, ['--version']);
 
       this.logDebug(`Valid Godot path: ${path}`);
       this.validatedPaths.set(path, true);
@@ -340,6 +354,59 @@ class GodotServer {
       this.validatedPaths.set(path, false);
       return false;
     }
+  }
+
+  /**
+   * Glob Windows-side Program Files for Godot installs, usable from WSL.
+   * Returns candidates newest-version-first (best-effort semver sort on
+   * the enclosing directory name).
+   */
+  private findWSLWindowsGodotCandidates(): string[] {
+    const programRoots = [
+      '/mnt/c/Program Files',
+      '/mnt/c/Program Files (x86)',
+    ];
+    const candidates: Array<{ path: string; version: number[] }> = [];
+
+    for (const root of programRoots) {
+      if (!existsSync(root)) continue;
+      let entries: string[];
+      try {
+        entries = readdirSync(root);
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        if (!/^Godot(_v|_)/i.test(entry)) continue;
+        const dirPath = join(root, entry);
+        let files: string[];
+        try {
+          files = readdirSync(dirPath);
+        } catch {
+          continue;
+        }
+        const godotExe = files.find((f) => /^Godot.*\.exe$/i.test(f));
+        if (!godotExe) continue;
+
+        const versionMatch = entry.match(/_v?(\d+)\.(\d+)(?:\.(\d+))?/);
+        const version = versionMatch
+          ? [versionMatch[1], versionMatch[2], versionMatch[3] ?? '0'].map((n) => parseInt(n, 10))
+          : [0, 0, 0];
+
+        candidates.push({ path: join(dirPath, godotExe), version });
+      }
+    }
+
+    candidates.sort((a, b) => {
+      for (let i = 0; i < 3; i += 1) {
+        const diff = (b.version[i] ?? 0) - (a.version[i] ?? 0);
+        if (diff !== 0) return diff;
+      }
+      return 0;
+    });
+
+    return candidates.map((c) => c.path);
   }
 
   /**
@@ -397,6 +464,14 @@ class GodotServer {
         '/snap/bin/godot',
         `${process.env.HOME}/.local/bin/godot`
       );
+
+      // WSL — also probe Windows-side Program Files for Godot installs
+      // so first-run UX on WSL doesn't require manual GODOT_PATH.
+      if (release().toLowerCase().includes('microsoft')) {
+        for (const wslCandidate of this.findWSLWindowsGodotCandidates()) {
+          possiblePaths.push(wslCandidate);
+        }
+      }
     }
 
     // Try each possible path
@@ -454,6 +529,64 @@ class GodotServer {
 
     this.logDebug(`Failed to set invalid Godot path: ${normalizedPath}`);
     return false;
+  }
+
+  private getWSLInteropDetails(godotPath: string | null = this.godotPath): WSLInteropDetails {
+    return wslGetInteropDetails(godotPath);
+  }
+
+  private convertMountedPathToWindows(path: string): string | null {
+    return wslConvertMountedPathToWindows(path);
+  }
+
+  private ensureWSLWindowsProjectPath(projectPath: string): void {
+    wslEnsureWindowsProjectPath(projectPath);
+  }
+
+  private translatePathForGodot(path: string, details: WSLInteropDetails, label: string): string {
+    return wslTranslatePathForGodot(path, details, label);
+  }
+
+  private prepareProjectScopedCommand(
+    projectPath: string,
+    prefixArgs: string[] = [],
+    suffixArgs: string[] = []
+  ): PreparedGodotCommand {
+    if (!this.godotPath) {
+      throw new Error('Could not find a valid Godot executable path');
+    }
+
+    const interop = this.getWSLInteropDetails(this.godotPath);
+    if (interop.mode === 'wsl_windows') {
+      this.ensureWSLWindowsProjectPath(projectPath);
+      return {
+        command: this.godotPath,
+        args: [...prefixArgs, '--path', '.', ...suffixArgs],
+        cwd: projectPath,
+        projectPathForDisplay: projectPath,
+        targetProjectPath: '.',
+      };
+    }
+
+    return {
+      command: this.godotPath,
+      args: [...prefixArgs, '--path', projectPath, ...suffixArgs],
+      projectPathForDisplay: projectPath,
+      targetProjectPath: projectPath,
+    };
+  }
+
+  private async getGodotVersionText(timeout?: number): Promise<string> {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        throw new Error('Could not find a valid Godot executable path');
+      }
+    }
+
+    const execOptions = timeout ? { timeout } : undefined;
+    const { stdout } = await execFileAsync(this.godotPath, ['--version'], execOptions);
+    return String(stdout).trim();
   }
 
   /**
@@ -542,7 +675,7 @@ class GodotServer {
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
     const RUNTIME_PORT = 7777;
-    const RUNTIME_HOST = '127.0.0.1';
+    const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const TIMEOUT_MS = 10000;
 
     return new Promise((resolve) => {
@@ -1216,51 +1349,52 @@ class GodotServer {
     try {
       // Serialize parameters into a temp file to avoid shell/cmd JSON escaping issues
       // (notably Windows command-line parsing of sequences such as \t, \r, and \").
+      // Under WSL→Windows Godot, /tmp is not visible to the Windows process — write
+      // the payload to a Windows-visible location (e.g. /mnt/c/Windows/Temp) and
+      // pass the Windows-form path via the @file: flag so Godot's FileAccess can
+      // resolve it.
       const paramsJson = JSON.stringify(snakeCaseParams);
-      const paramsDir = mkdtempSync(join(tmpdir(), 'gopeak-params-'));
+      const interop = this.getWSLInteropDetails(this.godotPath);
+      const windowsTempRoot = resolveWSLWindowsTempDir(interop);
+      const paramsRoot = windowsTempRoot ?? tmpdir();
+      const paramsDir = mkdtempSync(join(paramsRoot, 'gopeak-params-'));
       const paramsFilePath = join(paramsDir, `${operation}.json`);
       writeFileSync(paramsFilePath, paramsJson, 'utf8');
-
-      // Escape the params file reference for the current shell.
-      const paramsFileArg = `@file:${paramsFilePath}`;
-      const escapedParams = paramsFileArg.replace(/'/g, "'\\''");
-      const isWindows = process.platform === 'win32';
-      const quotedParams = isWindows
-        ? `\"${paramsFileArg.replace(/\"/g, '\\"')}\"`
-        : `'${escapedParams}'`;
-
+      const paramsFilePathForGodot = wslTranslatePathForGodot(
+        paramsFilePath,
+        interop,
+        'Operation params file'
+      );
 
       // Add debug arguments if debug mode is enabled
       const debugArgs = this.godotDebugMode ? ['--debug-godot'] : [];
+      const operationsScriptPath = this.translatePathForGodot(
+        this.operationsScriptPath,
+        interop,
+        'Godot operations script'
+      );
+      const prepared = this.prepareProjectScopedCommand(
+        projectPath,
+        ['--headless'],
+        ['--script', operationsScriptPath, operation, `@file:${paramsFilePathForGodot}`, ...debugArgs]
+      );
 
-      // Construct the command with the operation and JSON parameters
-      const cmd = [
-        `"${this.godotPath}"`,
-        '--headless',
-        '--path',
-        `"${projectPath}"`,
-        '--script',
-        `"${this.operationsScriptPath}"`,
-        operation,
-        quotedParams, // Pass the JSON string as a single argument
-        ...debugArgs,
-      ].join(' ');
-
-      this.logDebug(`Command: ${cmd}`);
+      this.logDebug(`Command: ${prepared.command} ${prepared.args.join(' ')}`);
 
       try {
-        const { stdout, stderr } = await execAsync(cmd);
-        return { stdout, stderr };
+        const execOptions = prepared.cwd ? { cwd: prepared.cwd } : undefined;
+        const { stdout, stderr } = await execFileAsync(prepared.command, prepared.args, execOptions);
+        return { stdout: String(stdout), stderr: String(stderr) };
       } finally {
         rmSync(paramsDir, { recursive: true, force: true });
       }
     } catch (error: unknown) {
       // If execAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
-        const execError = error as Error & { stdout: string; stderr: string };
+        const execError = error as Error & { stdout: string | Buffer; stderr: string | Buffer };
         return {
-          stdout: execError.stdout,
-          stderr: execError.stderr,
+          stdout: String(execError.stdout),
+          stderr: String(execError.stderr),
         };
       }
 
@@ -1734,9 +1868,11 @@ class GodotServer {
         );
       }
 
-      this.logDebug(`Launching Godot editor for project: ${args.projectPath}`);
-      const process = spawn(this.godotPath, ['-e', '--path', args.projectPath], {
+      const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
+      this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
+      const process = spawn(prepared.command, prepared.args, {
         stdio: 'pipe',
+        cwd: prepared.cwd,
       });
 
       process.on('error', (err: Error) => {
@@ -1747,7 +1883,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot editor launched successfully for project at ${args.projectPath}.`,
+            text: `Godot editor launched successfully for project at ${prepared.projectPathForDisplay}.`,
           },
         ],
       };
@@ -1819,14 +1955,15 @@ class GodotServer {
         this.activeProcess.process.kill();
       }
 
-      const cmdArgs = ['-d', '--path', args.projectPath];
+      const suffixArgs: string[] = [];
       if (args.scene && this.validatePath(args.scene)) {
         this.logDebug(`Adding scene parameter: ${args.scene}`);
-        cmdArgs.push(args.scene);
+        suffixArgs.push(args.scene);
       }
 
-      this.logDebug(`Running Godot project: ${args.projectPath}`);
-      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-d'], suffixArgs);
+      this.logDebug(`Running Godot project: ${prepared.projectPathForDisplay}`);
+      const process = spawn(prepared.command, prepared.args, { stdio: 'pipe', cwd: prepared.cwd });
       const output: string[] = [];
       const errors: string[] = [];
 
@@ -1860,7 +1997,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = { process, output, errors, launchedAt: Date.now() };
 
       return {
         content: [
@@ -1995,27 +2132,12 @@ class GodotServer {
    */
   private async handleGetGodotVersion() {
     try {
-      // Ensure godotPath is set
-      if (!this.godotPath) {
-        await this.detectGodotPath();
-        if (!this.godotPath) {
-          return this.createErrorResponse(
-            'Could not find a valid Godot executable path',
-            [
-              'Ensure Godot is installed correctly',
-              'Set GODOT_PATH environment variable to specify the correct path',
-            ]
-          );
-        }
-      }
-
-      this.logDebug('Getting Godot version');
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`);
+      const version = await this.getGodotVersionText();
       return {
         content: [
           {
             type: 'text',
-            text: stdout.trim(),
+            text: version,
           },
         ],
       };
@@ -2196,8 +2318,7 @@ class GodotServer {
       this.logDebug(`Getting project info for: ${args.projectPath}`);
   
       // Get Godot version
-      const execOptions = { timeout: 10000 }; // 10 second timeout
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`, execOptions);
+      const version = await this.getGodotVersionText(10000);
   
       // Get project structure using the recursive method
       const projectStructure = await this.getProjectStructureAsync(args.projectPath);
@@ -2224,7 +2345,7 @@ class GodotServer {
               {
                 name: projectName,
                 path: args.projectPath,
-                godotVersion: stdout.trim(),
+                godotVersion: version,
                 structure: projectStructure,
               },
               null,
@@ -3506,8 +3627,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
-      const version = versionOutput.trim();
+      const version = await this.getGodotVersionText();
 
       if (!this.isGodot44OrLater(version)) {
         return this.createErrorResponse(
@@ -3606,8 +3726,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
-      const version = versionOutput.trim();
+      const version = await this.getGodotVersionText();
 
       if (!this.isGodot44OrLater(version)) {
         return this.createErrorResponse(
@@ -4386,11 +4505,20 @@ class GodotServer {
       }
 
       const exportFlag = args.debug ? '--export-debug' : '--export-release';
-      const cmd = `"${this.godotPath}" --headless --path "${args.projectPath}" ${exportFlag} "${args.preset}" "${args.outputPath}"`;
+      const interop = this.getWSLInteropDetails(this.godotPath);
+      const translatedOutputPath = this.translatePathForGodot(args.outputPath, interop, 'Export output path');
+      const prepared = this.prepareProjectScopedCommand(
+        args.projectPath,
+        ['--headless'],
+        [exportFlag, args.preset, translatedOutputPath]
+      );
       
-      this.logDebug(`Export command: ${cmd}`);
+      this.logDebug(`Export command: ${prepared.command} ${prepared.args.join(' ')}`);
       
-      const { stdout, stderr } = await execAsync(cmd, { timeout: 300000 }); // 5 minute timeout for exports
+      const execOptions = prepared.cwd
+        ? { cwd: prepared.cwd, timeout: 300000 }
+        : { timeout: 300000 };
+      const { stdout, stderr } = await execFileAsync(prepared.command, prepared.args, execOptions); // 5 minute timeout for exports
 
       if (stderr && (stderr.includes('ERROR') || stderr.includes('Invalid preset'))) {
         return this.createErrorResponse(
