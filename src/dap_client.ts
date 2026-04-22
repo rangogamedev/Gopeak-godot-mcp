@@ -1,6 +1,6 @@
 import { createConnection, type Socket } from 'node:net';
 
-import { getWSLInteropDetails, resolveWindowsHostIp } from './wsl_interop.js';
+import { getWSLInteropDetails, resolveDefaultDAPPort, resolveWindowsHostIp } from './wsl_interop.js';
 
 function resolveDefaultDAPHost(): string {
   const envOverride =
@@ -72,8 +72,8 @@ export class GodotDAPClient {
   private lastThreadId: number = 1;
   private breakpoints: Map<string, Set<number>> = new Map();
 
-  constructor(port: number = 6006, host?: string) {
-    this.port = port;
+  constructor(port?: number, host?: string) {
+    this.port = port ?? resolveDefaultDAPPort();
     this.host = host ?? resolveDefaultDAPHost();
     this.pendingRequests = new Map();
   }
