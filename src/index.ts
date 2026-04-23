@@ -88,7 +88,8 @@ class GodotServer {
   private cachedToolDefinitions: MCPToolDefinition[] = [];
   private toolDefinitionFactory: (() => MCPToolDefinition[]) | null = null;
   private readonly toolExposureProfile: 'compact' | 'full' | 'legacy';
-  private readonly toolsListPageSize: number;
+  private toolsListPageSize: number;
+  private toolsListPageSizeExplicit: boolean = false;
   private activeGroups: Set<string> = new Set();
   private readonly compactAliasToLegacy: Record<string, string> = {
     'tool.catalog': 'tool_catalog',
@@ -183,10 +184,12 @@ class GodotServer {
       this.toolExposureProfile = 'compact';
     }
 
-    const rawToolsPageSize = parseInt(process.env.GOPEAK_TOOLS_PAGE_SIZE || '33', 10);
+    const explicitToolsPageSize = process.env.GOPEAK_TOOLS_PAGE_SIZE;
+    const rawToolsPageSize = parseInt(explicitToolsPageSize || '33', 10);
     this.toolsListPageSize = Number.isFinite(rawToolsPageSize) && rawToolsPageSize > 0
       ? rawToolsPageSize
       : 33;
+    this.toolsListPageSizeExplicit = explicitToolsPageSize !== undefined && explicitToolsPageSize !== '';
 
     // Pre-activate dynamic tool groups listed in GOPEAK_STARTUP_ACTIVE_GROUPS
     // (or MCP_STARTUP_ACTIVE_GROUPS). Comma-separated group names matched
@@ -1043,6 +1046,31 @@ class GodotServer {
       console.error(
         `[SERVER] Pre-activating ${activated.length} tool group(s) from startup env: ${activated.join(', ')}.`,
       );
+    }
+
+    // Auto-raise the tools/list page size if pre-activation pushes the
+    // exposed tool count past the configured page. MCP `tools/list` chunks
+    // at `toolsListPageSize` with `nextCursor` for subsequent pages;
+    // clients that do not follow `nextCursor` for deferred-tool discovery
+    // (Claude Code) only see page 1, so pre-activated dynamic tools would
+    // be stranded on page 2+. Only auto-raise when the user has not set
+    // `GOPEAK_TOOLS_PAGE_SIZE` explicitly.
+    if (!this.toolsListPageSizeExplicit && this.toolExposureProfile === 'compact' && activated.length > 0) {
+      let activatedToolCount = 0;
+      for (const groupName of activated) {
+        const group = TOOL_GROUPS[groupName];
+        if (group) {
+          activatedToolCount += group.tools.length;
+        }
+      }
+      const compactAliasCount = Object.keys(this.compactAliasToLegacy).length;
+      const needed = compactAliasCount + activatedToolCount;
+      if (needed > this.toolsListPageSize) {
+        console.error(
+          `[SERVER] Raising tools/list page size ${this.toolsListPageSize} → ${needed} so all pre-activated tools fit in the first page (clients that do not follow nextCursor would otherwise miss ${needed - this.toolsListPageSize} tool(s)). Set GOPEAK_TOOLS_PAGE_SIZE explicitly to override.`,
+        );
+        this.toolsListPageSize = needed;
+      }
     }
   }
 
