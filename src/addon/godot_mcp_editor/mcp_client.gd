@@ -40,11 +40,15 @@ func _ready() -> void:
 
 # File logging — writes a single line per state change to
 # `user://mcp_editor_client.log`. Under WSL, `user://` resolves to
-# `%APPDATA%\Godot\app_userdata\<project>\logs\` which is tailable
-# from the Linux side via `/mnt/c/Users/.../app_userdata/.../logs/`.
+# `%APPDATA%\Godot\app_userdata\<project>\` which is tailable from
+# the Linux side via `/mnt/c/Users/.../app_userdata/.../`.
 # Godot editor does not produce its own log file (only child project
 # runs do) so this is the only reliable way to observe plugin state
 # when the editor is running on Windows and Claude Code on WSL.
+#
+# File writes are gated behind the `GOPEAK_PLUGIN_LOG=1` env var so
+# normal-dev users don't get a mystery log file. `print()` always
+# fires so the Editor Output panel still shows state.
 static func _log(level: String, kind: String, detail: String = "") -> void:
 	var line := "[%s] level=%s source=mcp_client kind=%s %s" % [
 		Time.get_datetime_string_from_system(true),
@@ -53,6 +57,8 @@ static func _log(level: String, kind: String, detail: String = "") -> void:
 		detail,
 	]
 	print(line)
+	if OS.get_environment("GOPEAK_PLUGIN_LOG") != "1":
+		return
 	var f := FileAccess.open(LOG_PATH, FileAccess.READ_WRITE)
 	if f == null:
 		f = FileAccess.open(LOG_PATH, FileAccess.WRITE)

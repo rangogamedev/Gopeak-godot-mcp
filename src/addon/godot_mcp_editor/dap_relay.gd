@@ -29,6 +29,8 @@ static func _log(level: String, kind: String, detail: String = "") -> void:
 		detail,
 	]
 	print(line)
+	if OS.get_environment("GOPEAK_PLUGIN_LOG") != "1":
+		return
 	var f := FileAccess.open(LOG_PATH, FileAccess.READ_WRITE)
 	if f == null:
 		f = FileAccess.open(LOG_PATH, FileAccess.WRITE)
