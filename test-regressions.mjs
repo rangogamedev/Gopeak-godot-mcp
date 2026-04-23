@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createBridge } from './build/godot-bridge.js';
+import { parseStartupActiveGroups } from './build/startup-active-groups.js';
 
 const INDEX_SOURCE = readFileSync(new URL('./src/index.ts', import.meta.url), 'utf8');
 const OPERATIONS_SOURCE = readFileSync(new URL('./src/scripts/godot_operations.gd', import.meta.url), 'utf8');
@@ -209,9 +210,65 @@ async function testEditorStatusPortConflict() {
   });
 }
 
+function testStartupActiveGroups() {
+  const known = ['dap', 'lsp', 'runtime', 'scene_advanced', 'uid'];
+
+  // Unset / empty / whitespace → no-op.
+  assert.deepEqual(parseStartupActiveGroups(undefined, known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups('', known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups('   ', known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups(',,,', known), { activated: [], unknown: [] });
+
+  // Single valid group.
+  assert.deepEqual(parseStartupActiveGroups('dap', known), { activated: ['dap'], unknown: [] });
+
+  // Multiple valid groups, order preserved.
+  assert.deepEqual(parseStartupActiveGroups('dap,lsp,runtime', known), {
+    activated: ['dap', 'lsp', 'runtime'],
+    unknown: [],
+  });
+
+  // Whitespace tolerated around commas + leading/trailing.
+  assert.deepEqual(parseStartupActiveGroups('  dap , lsp ,  runtime ', known), {
+    activated: ['dap', 'lsp', 'runtime'],
+    unknown: [],
+  });
+
+  // Case-insensitive match returns canonical casing.
+  assert.deepEqual(parseStartupActiveGroups('DAP,Lsp,Scene_Advanced', known), {
+    activated: ['dap', 'lsp', 'scene_advanced'],
+    unknown: [],
+  });
+
+  // Duplicate valid names collapse to one activation.
+  assert.deepEqual(parseStartupActiveGroups('dap,dap,DAP', known), {
+    activated: ['dap'],
+    unknown: [],
+  });
+
+  // Unknown names split out, valid names still applied.
+  assert.deepEqual(parseStartupActiveGroups('dap,bogus,lsp,alsoBogus', known), {
+    activated: ['dap', 'lsp'],
+    unknown: ['bogus', 'alsoBogus'],
+  });
+
+  // All unknown → empty activated, all captured in unknown.
+  assert.deepEqual(parseStartupActiveGroups('foo,bar', known), {
+    activated: [],
+    unknown: ['foo', 'bar'],
+  });
+
+  // Empty items interleaved with valid names.
+  assert.deepEqual(parseStartupActiveGroups(',dap,,lsp,', known), {
+    activated: ['dap', 'lsp'],
+    unknown: [],
+  });
+}
+
 async function main() {
   testStaleDisconnectRegression();
   testSceneToolsVectorRegression();
+  testStartupActiveGroups();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');
   assert.match(OPERATIONS_SOURCE, /params_json\.begins_with\("@file:"\)/, 'godot_operations.gd should load params from @file: payloads');

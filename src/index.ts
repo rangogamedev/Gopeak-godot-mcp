@@ -37,6 +37,7 @@ import { GodotBridge, getDefaultBridge } from './godot-bridge.js';
 import { getPrompt, listPrompts } from './prompts.js';
 import { buildToolDefinitions as buildToolDefinitionsForServer } from './tool-definitions.js';
 import { CORE_TOOL_GROUPS, TOOL_GROUPS } from './tool-groups.js';
+import { parseStartupActiveGroups } from './startup-active-groups.js';
 import { DEBUG_MODE, GODOT_DEBUG_MODE_DEFAULT, SERVER_VERSION } from './server-version.js';
 import type { GodotProcess, GodotServerConfig, MCPToolDefinition, OperationParams } from './server-types.js';
 
@@ -70,7 +71,8 @@ class GodotServer {
   private cachedToolDefinitions: MCPToolDefinition[] = [];
   private toolDefinitionFactory: (() => MCPToolDefinition[]) | null = null;
   private readonly toolExposureProfile: 'compact' | 'full' | 'legacy';
-  private readonly toolsListPageSize: number;
+  private toolsListPageSize: number;
+  private toolsListPageSizeExplicit: boolean = false;
   private activeGroups: Set<string> = new Set();
   private readonly compactAliasToLegacy: Record<string, string> = {
     'tool.catalog': 'tool_catalog',
@@ -165,10 +167,24 @@ class GodotServer {
       this.toolExposureProfile = 'compact';
     }
 
-    const rawToolsPageSize = parseInt(process.env.GOPEAK_TOOLS_PAGE_SIZE || '33', 10);
+    const explicitToolsPageSize = process.env.GOPEAK_TOOLS_PAGE_SIZE;
+    const rawToolsPageSize = parseInt(explicitToolsPageSize || '33', 10);
     this.toolsListPageSize = Number.isFinite(rawToolsPageSize) && rawToolsPageSize > 0
       ? rawToolsPageSize
       : 33;
+    // Track whether the user set the page-size env explicitly so the
+    // auto-raise path in applyStartupActiveGroups doesn't override a
+    // deliberate small page-size choice.
+    this.toolsListPageSizeExplicit = explicitToolsPageSize !== undefined && explicitToolsPageSize !== '';
+
+    // Pre-activate dynamic tool groups listed in GOPEAK_STARTUP_ACTIVE_GROUPS
+    // (or MCP_STARTUP_ACTIVE_GROUPS). Comma-separated group names matched
+    // case-insensitively against Object.keys(TOOL_GROUPS). Lets clients whose
+    // tool cache does not refresh on notifications/tools/list_changed (e.g.
+    // Claude Code) still see commonly-needed dynamic tools in the initial
+    // tools/list response without switching off the compact profile.
+    // No-op unless profile=compact.
+    this.applyStartupActiveGroups();
 
     // Initialize reverse parameter mappings
     for (const [snakeCase, camelCase] of Object.entries(this.parameterMappings)) {
@@ -809,6 +825,90 @@ class GodotServer {
   private notifyToolListChanged(): void {
     this.cachedToolDefinitions = [];
     this.server.sendToolListChanged().catch(() => {});
+  }
+
+  /**
+   * Seed `this.activeGroups` from `GOPEAK_STARTUP_ACTIVE_GROUPS` (or fallback
+   * `MCP_STARTUP_ACTIVE_GROUPS`). Called from the constructor before
+   * `this.server` is instantiated, so the first `tools/list` response on MCP
+   * handshake already includes these groups' tools. This is the workaround
+   * for clients whose tool cache does not refresh on
+   * `notifications/tools/list_changed` (e.g. Claude Code).
+   *
+   * Contract:
+   *  - Unset or empty env: no-op.
+   *  - `toolExposureProfile !== 'compact'`: no-op + one-line stderr warning
+   *    (full/legacy already expose all tools, so pre-activation is redundant).
+   *  - Unknown group names: per-batch stderr warning; valid names still applied.
+   *  - Case-insensitive match against `Object.keys(TOOL_GROUPS)`.
+   *  - Whitespace around commas tolerated; empty items dropped.
+   *
+   * Parse logic lives in `./startup-active-groups.ts` as a pure function so
+   * it is unit-testable without spawning the MCP server.
+   */
+  private applyStartupActiveGroups(): void {
+    const raw = process.env.GOPEAK_STARTUP_ACTIVE_GROUPS ?? process.env.MCP_STARTUP_ACTIVE_GROUPS ?? '';
+    if (raw.trim() === '') {
+      return;
+    }
+
+    if (this.toolExposureProfile !== 'compact') {
+      console.error(
+        `[SERVER] GOPEAK_STARTUP_ACTIVE_GROUPS ignored under profile=${this.toolExposureProfile} ` +
+        `(only the compact profile benefits from pre-activation; full/legacy already expose all tools).`,
+      );
+      return;
+    }
+
+    const knownGroups = Object.keys(TOOL_GROUPS);
+    const { activated, unknown } = parseStartupActiveGroups(raw, knownGroups);
+
+    for (const name of activated) {
+      this.activeGroups.add(name);
+    }
+
+    if (unknown.length > 0) {
+      console.error(
+        `[SERVER] GOPEAK_STARTUP_ACTIVE_GROUPS: ignoring unknown group(s): ${unknown.join(', ')}. ` +
+        `Known dynamic groups: ${knownGroups.join(', ')}.`,
+      );
+    }
+
+    if (activated.length > 0) {
+      console.error(
+        `[SERVER] Pre-activating ${activated.length} tool group(s) from startup env: ${activated.join(', ')}.`,
+      );
+    }
+
+    // Auto-raise the tools/list page size if pre-activation pushes the
+    // exposed tool count past the configured page. MCP `tools/list` chunks
+    // the response at `toolsListPageSize` and returns a `nextCursor` for
+    // subsequent pages. Clients that do not follow `nextCursor` for
+    // deferred-tool discovery (Claude Code at time of writing) only see
+    // page 1, so pre-activated dynamic tools would be stranded on page 2+.
+    //
+    // Only auto-raise when the user has not explicitly set
+    // `GOPEAK_TOOLS_PAGE_SIZE` — a deliberate small page-size choice is
+    // preserved. Compact-profile first page = compactAlias count +
+    // activated-group tool count; we aim to fit that in one page.
+    if (!this.toolsListPageSizeExplicit && this.toolExposureProfile === 'compact' && activated.length > 0) {
+      let activatedToolCount = 0;
+      for (const groupName of activated) {
+        const group = TOOL_GROUPS[groupName];
+        if (group) {
+          activatedToolCount += group.tools.length;
+        }
+      }
+      const compactAliasCount = Object.keys(this.compactAliasToLegacy).length;
+      const needed = compactAliasCount + activatedToolCount;
+      if (needed > this.toolsListPageSize) {
+        const raised = needed;
+        console.error(
+          `[SERVER] Raising tools/list page size ${this.toolsListPageSize} → ${raised} so all pre-activated tools fit in the first page (clients that do not follow nextCursor would otherwise miss ${needed - this.toolsListPageSize} tool(s)). Set GOPEAK_TOOLS_PAGE_SIZE explicitly to override.`,
+        );
+        this.toolsListPageSize = raised;
+      }
+    }
   }
 
   private autoActivateMatchingGroups(query: string): string[] {
