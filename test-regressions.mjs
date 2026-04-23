@@ -22,6 +22,7 @@ import {
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
+import { parseStartupActiveGroups } from './build/startup-active-groups.js';
 
 const INDEX_SOURCE = readFileSync(new URL('./src/index.ts', import.meta.url), 'utf8');
 const CLI_NOTIFY_SOURCE = readFileSync(new URL('./src/cli/notify.ts', import.meta.url), 'utf8');
@@ -448,10 +449,66 @@ function testWSLInterop() {
   );
 }
 
+function testStartupActiveGroups() {
+  const known = ['dap', 'lsp', 'runtime', 'scene_advanced', 'uid'];
+
+  // Unset / empty / whitespace → no-op.
+  assert.deepEqual(parseStartupActiveGroups(undefined, known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups('', known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups('   ', known), { activated: [], unknown: [] });
+  assert.deepEqual(parseStartupActiveGroups(',,,', known), { activated: [], unknown: [] });
+
+  // Single valid group.
+  assert.deepEqual(parseStartupActiveGroups('dap', known), { activated: ['dap'], unknown: [] });
+
+  // Multiple valid groups, order preserved.
+  assert.deepEqual(parseStartupActiveGroups('dap,lsp,runtime', known), {
+    activated: ['dap', 'lsp', 'runtime'],
+    unknown: [],
+  });
+
+  // Whitespace tolerated around commas + leading/trailing.
+  assert.deepEqual(parseStartupActiveGroups('  dap , lsp ,  runtime ', known), {
+    activated: ['dap', 'lsp', 'runtime'],
+    unknown: [],
+  });
+
+  // Case-insensitive match returns canonical casing.
+  assert.deepEqual(parseStartupActiveGroups('DAP,Lsp,Scene_Advanced', known), {
+    activated: ['dap', 'lsp', 'scene_advanced'],
+    unknown: [],
+  });
+
+  // Duplicate valid names collapse to one activation.
+  assert.deepEqual(parseStartupActiveGroups('dap,dap,DAP', known), {
+    activated: ['dap'],
+    unknown: [],
+  });
+
+  // Unknown names split out, valid names still applied.
+  assert.deepEqual(parseStartupActiveGroups('dap,bogus,lsp,alsoBogus', known), {
+    activated: ['dap', 'lsp'],
+    unknown: ['bogus', 'alsoBogus'],
+  });
+
+  // All unknown → empty activated, all captured in unknown.
+  assert.deepEqual(parseStartupActiveGroups('foo,bar', known), {
+    activated: [],
+    unknown: ['foo', 'bar'],
+  });
+
+  // Empty items interleaved with valid names.
+  assert.deepEqual(parseStartupActiveGroups(',dap,,lsp,', known), {
+    activated: ['dap', 'lsp'],
+    unknown: [],
+  });
+}
+
 async function main() {
   testStaleDisconnectRegression();
   testWSLInterop();
   testSceneToolsVectorRegression();
+  testStartupActiveGroups();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');
   assert.match(
