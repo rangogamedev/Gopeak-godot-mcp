@@ -4,12 +4,17 @@ extends EditorPlugin
 const MCPEditorClientScript = preload("mcp_client.gd")
 const MCPToolExecutorScript = preload("tool_executor.gd")
 
+const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
+const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
+
 var _mcp_client: Node
 var _tool_executor: Node
 var _status_label: Label
 
 
 func _enter_tree() -> void:
+	_register_project_settings()
+
 	_mcp_client = MCPEditorClientScript.new()
 	_mcp_client.name = "MCPEditorClient"
 	add_child(_mcp_client)
@@ -67,6 +72,38 @@ func _on_disconnected() -> void:
 	if _status_label:
 		_status_label.text = "MCP: Disconnected"
 		_status_label.add_theme_color_override("font_color", Color.RED)
+
+
+func _register_project_settings() -> void:
+	# Surface bridge host/port in Project Settings UI with sensible defaults.
+	# Designers can override per-project (e.g. point at the WSL host IP when
+	# Godot runs on Windows and the bridge binds on a WSL interface).
+	# Default to the IPv4 literal so Windows resolvers don't try the AAAA
+	# record first and eat a ~30s timeout when the bridge node listens only
+	# on IPv4 (fork binds 0.0.0.0:6505 = IPv4). Set the value via
+	# set_setting without the has_setting guard so existing projects pick
+	# up the fixed default on fork update. Users who intentionally set a
+	# different host via Project Settings UI write their own value and it
+	# persists in project.godot, overriding this default.
+	if not ProjectSettings.has_setting(SETTING_BRIDGE_HOST):
+		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "127.0.0.1")
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "127.0.0.1")
+	ProjectSettings.add_property_info({
+		"name": SETTING_BRIDGE_HOST,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "Host the MCP editor bridge should connect to (default: 127.0.0.1 — IPv4 literal avoids ~30s WSL autoforward AAAA fallback).",
+	})
+
+	if not ProjectSettings.has_setting(SETTING_BRIDGE_PORT):
+		ProjectSettings.set_setting(SETTING_BRIDGE_PORT, 6505)
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_PORT, 6505)
+	ProjectSettings.add_property_info({
+		"name": SETTING_BRIDGE_PORT,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1,65535,1",
+	})
 
 
 func _on_tool_requested(request_id: String, tool_name: String, args: Dictionary) -> void:
