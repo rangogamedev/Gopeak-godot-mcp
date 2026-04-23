@@ -1,0 +1,53 @@
+# Declare normalization so checkouts are consistent across Windows / WSL /
+# Linux / macOS. Without this file, `install-addon.ps1` on Windows may copy
+# `.gd` files with CRLF line endings that Godot on a case-sensitive Linux
+# filesystem then reads differently, and `install-addon.sh` under `/mnt/c`
+# (WSL) can flip back.
+#
+# Rule of thumb: scripts and source stay LF; PowerShell stays CRLF so it
+# runs natively on Windows; everything else auto-detects.
+
+* text=auto
+
+# Shell, TypeScript/JavaScript, Markdown — always LF.
+*.sh            text eol=lf
+*.mjs           text eol=lf
+*.cjs           text eol=lf
+*.js            text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Godot source + project files — LF (Godot editor on Windows writes LF by
+# default; keep it that way so `install-addon.{sh,ps1}` round-trips cleanly).
+*.gd            text eol=lf
+*.tscn          text eol=lf
+*.tres          text eol=lf
+*.godot         text eol=lf
+*.cfg           text eol=lf
+*.import        text eol=lf
+
+# PowerShell scripts — CRLF so they run natively on Windows PowerShell.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+
+# Binary assets — no normalization.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.ogg           binary
+*.wav           binary
+*.mp3           binary
+*.ttf           binary
+*.otf           binary
+*.woff          binary
+*.woff2         binary
+*.zip           binary
+*.exe           binary
+*.dll           binary
