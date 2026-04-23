@@ -49,6 +49,8 @@ func _plugin_log(kind: String) -> void:
 		kind,
 	]
 	print(line)
+	if OS.get_environment("GOPEAK_PLUGIN_LOG") != "1":
+		return
 	var f := FileAccess.open("user://mcp_editor_client.log", FileAccess.READ_WRITE)
 	if f == null:
 		f = FileAccess.open("user://mcp_editor_client.log", FileAccess.WRITE)
