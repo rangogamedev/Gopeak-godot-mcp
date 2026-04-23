@@ -60,6 +60,7 @@ class GodotServer {
   private lspClient: GodotLSPClient | null = null;
   private dapClient: GodotDAPClient | null = null;
   private bridgeStartupError: string | null = null;
+  private godotReadyPromise: Promise<void> | null = null;
   private lastProjectPath: string | null = null;
   private recordingMode: 'lite' | 'full' = (process.env.LOG_MODE === 'full' ? 'full' : 'lite');
   private logQueue: Array<{ filePath: string; payload: Record<string, unknown> }> = [];
@@ -454,6 +455,44 @@ class GodotServer {
 
     this.logDebug(`Failed to set invalid Godot path: ${normalizedPath}`);
     return false;
+  }
+
+  /**
+   * Run Godot-path detection + validation off the startup critical path.
+   * Called after the stdio transport is attached so the MCP handshake does
+   * not block on the slow Windows-exe `--version` spawn under WSL (binfmt_misc
+   * + Windows Defender can make a cold `.exe` spawn take 5–10s). Tool
+   * handlers either await `this.godotReadyPromise` explicitly or fall through
+   * to the lazy-detect guards already in `executeOperation` and
+   * `getGodotVersionText`.
+   */
+  private async detectAndValidateGodotPath(): Promise<void> {
+    await this.detectGodotPath();
+
+    if (!this.godotPath) {
+      console.error('[SERVER] Failed to find a valid Godot executable path');
+      console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
+      if (this.strictPathValidation) {
+        process.exit(1);
+      }
+      return;
+    }
+
+    const isValid = await this.isValidGodotPath(this.godotPath);
+
+    if (!isValid) {
+      if (this.strictPathValidation) {
+        console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
+        console.error('[SERVER] Please set a valid GODOT_PATH environment variable or provide a valid path');
+        process.exit(1);
+      }
+      console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
+      console.error('[SERVER] This may cause issues when executing Godot commands');
+      console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
+      return;
+    }
+
+    console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
   }
 
   /**
@@ -6334,37 +6373,24 @@ class GodotServer {
    */
   async run() {
     try {
-      // Detect Godot path before starting the server
-      await this.detectGodotPath();
-
-      if (!this.godotPath) {
-        console.error('[SERVER] Failed to find a valid Godot executable path');
-        console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
-        process.exit(1);
-      }
-
-      // Check if the path is valid
-      const isValid = await this.isValidGodotPath(this.godotPath);
-
-      if (!isValid) {
-        if (this.strictPathValidation) {
-          // In strict mode, exit if the path is invalid
-          console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] Please set a valid GODOT_PATH environment variable or provide a valid path');
-          process.exit(1);
-        } else {
-          // In compatibility mode, warn but continue with the default path
-          console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] This may cause issues when executing Godot commands');
-          console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
-        }
-      }
-
-      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
-
+      // Attach the stdio MCP transport FIRST so the server can respond to
+      // protocol-level messages (initialize, prompts/list, tools/list) within
+      // ~100ms of spawn. Godot-path detection runs afterwards in the
+      // background: on WSL→Windows, `execFileAsync` spawning a Windows `.exe`
+      // from WSL can take 5–10s cold due to binfmt_misc + Defender, which
+      // previously gated the MCP handshake and starved
+      // `scripts/smoke-test.mjs` (plus any other MCP supervisor) that
+      // expected an `initialize` response inside a few seconds.
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
       console.error('Godot MCP server running on stdio');
+
+      // Kick off Godot-path detection in the background. Tool handlers that
+      // need `this.godotPath` already have lazy `detectGodotPath()` fallbacks
+      // (`executeOperation`, `getGodotVersionText`), so no behaviour change
+      // for tools — the probe just finishes faster than the first tool call
+      // in the common case.
+      this.godotReadyPromise = this.detectAndValidateGodotPath();
 
       // Start the Godot Editor Bridge (WebSocket server for editor plugin).
       // Bridge startup issues should not take down the stdio MCP server.
