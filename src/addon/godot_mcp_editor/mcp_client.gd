@@ -6,8 +6,8 @@ signal connected
 signal disconnected
 signal tool_requested(request_id: String, tool_name: String, args: Dictionary)
 
-const DEFAULT_URL := "ws://localhost:6505/godot"
-const DEFAULT_HOST := "localhost"
+const DEFAULT_URL := "ws://127.0.0.1:6505/godot"
+const DEFAULT_HOST := "127.0.0.1"
 const DEFAULT_PORT := 6505
 const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"

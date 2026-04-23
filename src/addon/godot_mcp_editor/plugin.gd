@@ -109,14 +109,21 @@ func _register_project_settings() -> void:
 	# Surface bridge host/port in Project Settings UI with sensible defaults.
 	# Designers can override per-project (e.g. point at the WSL host IP when
 	# Godot runs on Windows and the bridge binds on a WSL interface).
+	# Default to the IPv4 literal so Windows resolvers don't try the AAAA
+	# record first and eat a ~30s timeout when the bridge node listens only
+	# on IPv4 (fork binds 0.0.0.0:6505 = IPv4). Set the value via
+	# set_setting without the has_setting guard so existing projects pick
+	# up the fixed default on fork update. Users who intentionally set a
+	# different host via Project Settings UI write their own value and it
+	# persists in project.godot, overriding this default.
 	if not ProjectSettings.has_setting(SETTING_BRIDGE_HOST):
-		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "localhost")
-	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "localhost")
+		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "127.0.0.1")
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "127.0.0.1")
 	ProjectSettings.add_property_info({
 		"name": SETTING_BRIDGE_HOST,
 		"type": TYPE_STRING,
 		"hint": PROPERTY_HINT_NONE,
-		"hint_string": "Host the MCP editor bridge should connect to (default: localhost).",
+		"hint_string": "Host the MCP editor bridge should connect to (default: 127.0.0.1 — IPv4 literal avoids ~30s WSL autoforward AAAA fallback).",
 	})
 
 	if not ProjectSettings.has_setting(SETTING_BRIDGE_PORT):
