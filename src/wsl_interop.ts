@@ -238,7 +238,7 @@ const RUNTIME_PORT_DEFAULT = 7777;
  *   1. `GOPEAK_RUNTIME_PORT` / `GODOT_RUNTIME_PORT` / `MCP_RUNTIME_PORT`
  *      env override (first valid wins).
  *   2. `7777` default (hardcoded constant on the autoload side; agreement
- *      enforced by `testRuntimePortEnvOverride_addonSide` in
+ *      enforced by `testRuntimePortAddonEnvOverride` in
  *      `test-regressions.mjs`).
  *
  * Invalid values (non-integer, ≤0, ≥65536) emit a warning to stderr and

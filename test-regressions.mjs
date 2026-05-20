@@ -213,14 +213,26 @@ async function testEditorStatusPortConflict() {
       const response = await waitForJsonLine(proc.stdout, (msg) => msg.id === 2);
       const payload = JSON.parse(response.result.content[0].text);
       assert.equal(payload.bridgeAvailable, false);
-      assert.match(payload.startupError ?? '', /EADDRINUSE/i);
-      assert.match(payload.note ?? '', /Bridge port is already in use/i);
-      // Fix B: structured holder info must accompany the legacy string field.
+      // Two valid failure paths to the same outcome (bridge cannot bind):
+      //   EADDRINUSE — non-gopeak holder (blocker succeeded in binding 6505).
+      //   OTHER      — gopeak holder (lockfile preflight detected a healthy
+      //                peer, e.g. when the dev machine has another live
+      //                Claude Code session). Surfaces the holder PID + parent
+      //                via the "Another gopeak instance is healthy" message.
+      assert.ok(payload.startupErrorInfo, 'startupErrorInfo block must be populated on bridge bind failure');
+      assert.ok(
+        payload.startupErrorInfo.code === 'EADDRINUSE' || payload.startupErrorInfo.code === 'OTHER',
+        `startupErrorInfo.code should be EADDRINUSE or OTHER, got ${payload.startupErrorInfo.code}`,
+      );
+      if (payload.startupErrorInfo.code === 'EADDRINUSE') {
+        assert.match(payload.startupError ?? '', /EADDRINUSE/i);
+        assert.match(payload.note ?? '', /Bridge port is already in use/i);
+      } else {
+        assert.match(payload.startupError ?? '', /Another gopeak instance is healthy/i);
+      }
       // findPortHolder may legitimately fail to identify the holder when lsof/ss
       // are absent (rare on Linux/WSL but possible in minimal containers); accept
-      // either a numeric PID or null + a present startupErrorInfo block.
-      assert.ok(payload.startupErrorInfo, 'startupErrorInfo block must be populated on EADDRINUSE');
-      assert.equal(payload.startupErrorInfo.code, 'EADDRINUSE', 'startupErrorInfo.code is EADDRINUSE');
+      // either a numeric PID or null.
       assert.ok(
         payload.holderPid === null || typeof payload.holderPid === 'number',
         'holderPid is number or null'
@@ -444,8 +456,15 @@ async function testPidLockfileHealthyHandoff() {
       const payload = JSON.parse(response.result.content[0].text);
 
       // B must NOT have reclaimed A (A's parent — this test process — is alive).
-      // Either B saw A's healthy lockfile and refused to bind (OTHER code), OR
-      // B raced and hit EADDRINUSE (which now reports A's PID).
+      // Two valid outcomes:
+      //   OTHER     — B read A's lockfile, saw it healthy, exited preflight.
+      //                This is the intended "healthy handoff" path.
+      //   EADDRINUSE — B raced past the lockfile read (rare with the polling
+      //                helper, but possible under heavy load) and got rejected
+      //                at bind. Still surfaces holderPid for diagnostic.
+      // Log which path was hit so a regression that always falls into the
+      // EADDRINUSE branch (lockfile preflight broken) is visible in CI.
+      console.log(`  testPidLockfileHealthyHandoff: B took path ${payload.startupErrorInfo?.code}`);
       assert.equal(payload.bridgeAvailable, false, 'B must not own the bridge while A is healthy');
       assert.ok(
         payload.startupErrorInfo?.code === 'OTHER' || payload.startupErrorInfo?.code === 'EADDRINUSE',
