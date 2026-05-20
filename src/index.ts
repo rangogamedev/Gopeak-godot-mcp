@@ -715,16 +715,18 @@ class GodotServer {
     process.stdin.on('end', () => onStdinClose('stdin:end'));
     process.stdin.on('close', () => onStdinClose('stdin:close'));
 
-    // Mechanism (3): parent-watchdog. Initial PPid is captured at boot. If
-    // it changes to 1 (orphaned), the parent died — exit. Negligible cost:
-    // one syscall every 2 seconds.
+    // Mechanism (3): parent-watchdog. If PPid changes to 1, the parent
+    // died and the process was reparented to init — exit. Only orphan-to-init
+    // is checked; a generic ppid change (e.g. systemd user-session restart,
+    // tmux re-attach) would spuriously shut down a healthy gopeak.
+    // Negligible cost: one syscall every 2 seconds.
     const initialPpid = typeof process.ppid === 'number' ? process.ppid : -1;
     if (initialPpid > 1) {
       const watchdog = setInterval(() => {
         const ppidNow = typeof process.ppid === 'number' ? process.ppid : -1;
-        if (ppidNow === 1 || (ppidNow > 0 && ppidNow !== initialPpid)) {
+        if (ppidNow === 1) {
           if (!this.shutdownInitiated) {
-            console.error(`[SERVER] Parent process changed (ppid ${initialPpid} → ${ppidNow}) — shutting down gracefully`);
+            console.error(`[SERVER] Parent process died (ppid ${initialPpid} → 1, orphaned to init) — shutting down gracefully`);
           }
           clearInterval(watchdog);
           requestShutdown('parent-watchdog', 0);
@@ -5833,13 +5835,17 @@ class GodotServer {
    */
   private async handleGetRuntimeStatus(args: any) {
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
         ['Provide a valid path to a Godot project directory']
       );
     }
+
+    // Resolve once so diagnostic messages report the actual port the env
+    // override pointed handleRuntimeCommand at — not a stale 7777 literal.
+    const runtimePort = resolveDefaultRuntimePort();
 
     try {
       const runtime = await this.handleRuntimeCommand('ping', {});
@@ -5879,7 +5885,7 @@ class GodotServer {
               status: 'process_running_runtime_disconnected',
               processActive: true,
               runtimeAddon: 'unreachable',
-              note: 'A Godot process is active, but the runtime addon did not respond on port 7777.',
+              note: `A Godot process is active, but the runtime addon did not respond on port ${runtimePort}.`,
               runtimeResponse: runtimeText,
             }, null, 2),
           }],

@@ -247,6 +247,36 @@ function findOrphanGopeakPids(): Array<{ pid: number; ppid: number; cmdline: str
 }
 
 /**
+ * Poll the OS until the given host:port is bindable. Used after reclaiming
+ * a process holding the port to close the narrow window where the process
+ * is gone but the kernel still has the socket in close-wait / TIME_WAIT.
+ * Resolves true when the port is free, false when the timeout elapses.
+ */
+async function waitForPortFree(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
+  const probeHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const isFree = await new Promise<boolean>((resolve) => {
+      const socket = createNetConnection({ host: probeHost, port }, () => {
+        // Connection succeeded means SOMETHING is listening — port not free.
+        socket.destroy();
+        resolve(false);
+      });
+      socket.once('error', (err) => {
+        socket.destroy();
+        // ECONNREFUSED = nothing listening = port free.
+        resolve((err as NodeJS.ErrnoException).code === 'ECONNREFUSED');
+      });
+    });
+    if (isFree) {
+      return true;
+    }
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  return false;
+}
+
+/**
  * Send SIGTERM, wait up to `timeoutMs` for the process to exit, then SIGKILL.
  * Resolves to true if the process is gone by the end, false otherwise.
  */
@@ -282,9 +312,10 @@ async function reclaimProcess(pid: number, timeoutMs = 2000): Promise<boolean> {
  * back to `ss`. Returns null fields if neither tool is available or both fail.
  */
 function findPortHolder(port: number): { pid: number | null; command: string | null } {
-  // lsof -nP -iTCP:PORT -sTCP:LISTEN -F pcL
+  // lsof -nP -iTCP:PORT -sTCP:LISTEN -F pc (-F pc selects PID + command;
+  // dropped L (login) since we don't parse it)
   try {
-    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -F pcL`, {
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -F pc`, {
       stdio: ['ignore', 'pipe', 'ignore'],
       encoding: 'utf8',
       timeout: 500,
@@ -539,6 +570,11 @@ export class GodotBridge extends EventEmitter {
       const reclaimed = await reclaimProcess(lock.pid, 2000);
       if (reclaimed) {
         this.reclaimedPidsAtStartup.push(lock.pid);
+        // Close the narrow race between process exit and the kernel
+        // releasing the socket. Node sets SO_REUSEADDR by default on Linux
+        // so this is usually a no-op, but on heavily loaded systems the
+        // socket can stay in close-wait briefly. Cheap insurance.
+        await waitForPortFree(this.host, this.port, 1500);
       }
       tryUnlinkBridgePidFile(this.port, lock.pid);
     } else if (lock) {
@@ -641,9 +677,11 @@ export class GodotBridge extends EventEmitter {
     // Defensive sibling sweep — runs in the background AFTER bind so it
     // doesn't block startup latency. Catches stale gopeaks holding ports
     // OTHER than our own (won't affect this instance's port — that's
-    // already taken care of by the lockfile preflight). Logs reclaims for
-    // observability but does not modify reclaimedPidsAtStartup since the
-    // startup phase is already complete.
+    // already taken care of by the lockfile preflight). Logs each reclaim
+    // for observability; the startup phase is already complete by the time
+    // this fires, so reclaimedPidsAtStartup is NOT mutated (that field
+    // captures only the synchronous preflight reclaims that affected the
+    // bind decision for this port).
     this.runBackgroundOrphanSweep();
   }
 
@@ -657,8 +695,8 @@ export class GodotBridge extends EventEmitter {
         await Promise.all(orphans.map(async (orphan) => {
           this.log('info', `Background orphan sweep: reclaiming gopeak PID ${orphan.pid} (ppid ${orphan.ppid} dead/init)`);
           const reclaimed = await reclaimProcess(orphan.pid, 2000);
-          if (reclaimed) {
-            this.reclaimedPidsAtStartup.push(orphan.pid);
+          if (!reclaimed) {
+            this.log('warn', `Background orphan sweep: PID ${orphan.pid} survived SIGTERM+SIGKILL`);
           }
         }));
       } catch (err) {
@@ -721,6 +759,10 @@ export class GodotBridge extends EventEmitter {
       this.pidFileOwned = false;
     }
     this.selfTestResult = null;
+    // Clear startupErrorInfo too so getStatus() between stop() and the next
+    // start() doesn't surface a stale EADDRINUSE from a previous attempt.
+    this.startupErrorInfo = null;
+    this.reclaimedPidsAtStartup = [];
 
     this.log('info', 'WebSocket bridge stopped');
   }
