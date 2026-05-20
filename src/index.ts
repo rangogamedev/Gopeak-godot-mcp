@@ -38,10 +38,12 @@ import {
   resolveWSLWindowsTempDir,
   resolveWindowsHostIp,
   resolveDefaultRuntimeHost,
+  resolveDefaultRuntimePort,
 } from './wsl_interop.js';
 import { mapProject } from './gdscript_parser.js';
 import { serveVisualization, setProjectPath, stopVisualizationServer } from './visualizer-server.js';
-import { GodotBridge, getDefaultBridge } from './godot-bridge.js';
+import { GodotBridge, getDefaultBridge, BridgeStartupError } from './godot-bridge.js';
+import type { BridgeStartupErrorInfo } from './godot-bridge.js';
 import { getPrompt, listPrompts } from './prompts.js';
 import { buildToolDefinitions as buildToolDefinitionsForServer } from './tool-definitions.js';
 import { CORE_TOOL_GROUPS, TOOL_GROUPS } from './tool-groups.js';
@@ -79,6 +81,7 @@ class GodotServer {
   private lspClient: GodotLSPClient | null = null;
   private dapClient: GodotDAPClient | null = null;
   private bridgeStartupError: string | null = null;
+  private bridgeStartupErrorInfo: BridgeStartupErrorInfo | null = null;
   private godotReadyPromise: Promise<void> | null = null;
   private lastProjectPath: string | null = null;
   private recordingMode: 'lite' | 'full' = (process.env.LOG_MODE === 'full' ? 'full' : 'lite');
@@ -686,6 +689,50 @@ class GodotServer {
     process.once('SIGHUP', () => requestShutdown('SIGHUP', 0));
     process.once('beforeExit', (code: number) => requestShutdown(`beforeExit:${code}`));
     process.once('exit', () => this.forceCleanupOnExit());
+
+    // Standard MCP-stdio shutdown: the parent (Claude Code, MCP Inspector,
+    // etc.) signals teardown by closing stdin. Without this handler, gopeak
+    // would survive its parent and orphan onto PID 1 — the root cause of the
+    // bridge-reliability incidents documented in wiki/topics/mcp_fork_notes.md
+    // and feedback memory feedback_mcp_bridge_reliability. Three independent
+    // mechanisms cover the failure mode because each can be inhibited by
+    // specific SDK/transport behaviors:
+    //   (1) `process.stdin.on('end'|'close')` — fires when the parent closes
+    //       its writable side of the pipe. Most reliable when the SDK
+    //       transport keeps stdin in flowing mode.
+    //   (2) `transport.onclose` — wired in run() once the transport exists.
+    //       Fires only when transport.close() is called explicitly by the
+    //       SDK; not a substitute for (1) but useful when present.
+    //   (3) Parent-process watchdog — polls `process.ppid` every 2s. When
+    //       PPid flips to 1 (orphaned to init), the parent is gone; exit.
+    //       This is the belt-and-suspenders safety net.
+    const onStdinClose = (source: string) => {
+      if (!this.shutdownInitiated) {
+        console.error(`[SERVER] Parent stdio closed (${source}) — shutting down gracefully`);
+      }
+      requestShutdown(source, 0);
+    };
+    process.stdin.on('end', () => onStdinClose('stdin:end'));
+    process.stdin.on('close', () => onStdinClose('stdin:close'));
+
+    // Mechanism (3): parent-watchdog. Initial PPid is captured at boot. If
+    // it changes to 1 (orphaned), the parent died — exit. Negligible cost:
+    // one syscall every 2 seconds.
+    const initialPpid = typeof process.ppid === 'number' ? process.ppid : -1;
+    if (initialPpid > 1) {
+      const watchdog = setInterval(() => {
+        const ppidNow = typeof process.ppid === 'number' ? process.ppid : -1;
+        if (ppidNow === 1 || (ppidNow > 0 && ppidNow !== initialPpid)) {
+          if (!this.shutdownInitiated) {
+            console.error(`[SERVER] Parent process changed (ppid ${initialPpid} → ${ppidNow}) — shutting down gracefully`);
+          }
+          clearInterval(watchdog);
+          requestShutdown('parent-watchdog', 0);
+        }
+      }, 2000);
+      // Don't keep the event loop alive solely for this poll.
+      watchdog.unref?.();
+    }
   }
 
   private async handleShutdown(source: string, exitCode?: number): Promise<void> {
@@ -730,7 +777,7 @@ class GodotServer {
     args: unknown,
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
-    const RUNTIME_PORT = 7777;
+    const RUNTIME_PORT = resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const TIMEOUT_MS = 10000;
 
@@ -1539,27 +1586,53 @@ class GodotServer {
 
   private getEditorStatusPayload() {
     const status = this.godotBridge.getStatus();
-    const isPortConflict = this.bridgeStartupError?.includes('EADDRINUSE') ?? false;
+    const isPortConflict = this.bridgeStartupErrorInfo?.code === 'EADDRINUSE'
+      || (this.bridgeStartupError?.includes('EADDRINUSE') ?? false);
 
     const launchedByMcp = this.editorProcess !== null;
     const editorPid = this.editorProcess?.process?.pid ?? null;
     const launchedAt = this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null;
     const tracked_project_path = this.editorProcess?.projectPath ?? null;
 
+    const conflictNote = (() => {
+      if (!isPortConflict) {
+        return undefined;
+      }
+      const info = this.bridgeStartupErrorInfo;
+      if (info?.holderPid !== null && info?.holderPid !== undefined) {
+        return `Bridge port is already in use by ${info.holderCommand ?? 'unknown'} (PID ${info.holderPid}). Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.`;
+      }
+      return 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.';
+    })();
+
+    const conflictSuggestion = (() => {
+      if (!isPortConflict) {
+        return undefined;
+      }
+      const info = this.bridgeStartupErrorInfo;
+      if (info?.holderPid !== null && info?.holderPid !== undefined) {
+        return `Run \`kill ${info.holderPid}\` to free the port, then restart Claude Code.`;
+      }
+      return 'Stop duplicate gopeak/MCP server instances or re-run the command from the same server process that owns the bridge port.';
+    })();
+
     return {
       ...status,
+      // Backward-compatible surface: `bridgeAvailable` boolean + `startupError`
+      // string (matches /EADDRINUSE/i in legacy regression test).
       bridgeAvailable: this.bridgeStartupError === null,
       startupError: this.bridgeStartupError,
+      // Structured holder info from BridgeStartupErrorInfo (new fields).
+      startupErrorInfo: this.bridgeStartupErrorInfo,
+      holderPid: this.bridgeStartupErrorInfo?.holderPid ?? null,
+      holderCommand: this.bridgeStartupErrorInfo?.holderCommand ?? null,
+      reclaimedPidsAtStartup: this.bridgeStartupErrorInfo?.reclaimedPids ?? [],
       launched_by_mcp: launchedByMcp,
       editor_pid: editorPid,
       launched_at: launchedAt,
       tracked_project_path,
-      note: isPortConflict
-        ? 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.'
-        : undefined,
-      suggestion: isPortConflict
-        ? 'Stop duplicate gopeak/MCP server instances or re-run the command from the same server process that owns the bridge port.'
-        : undefined,
+      note: conflictNote,
+      suggestion: conflictSuggestion,
     };
   }
 
@@ -6879,6 +6952,19 @@ class GodotServer {
       // MCP supervisor) that expected an `initialize` response inside
       // a few seconds.
       const transport = new StdioServerTransport();
+      // Standard MCP-stdio shutdown signal: when the parent (Claude Code,
+      // MCP Inspector, etc.) closes stdin, the transport emits onclose.
+      // Without this hook, gopeak survives its parent and orphans onto
+      // PID 1 — the root cause of the bridge-reliability incidents
+      // documented in wiki/topics/mcp_fork_notes.md (orphan gopeaks holding
+      // :6505 across sessions, leaving the editor plugin paired with a
+      // dead bridge). See feedback_mcp_bridge_reliability memory.
+      transport.onclose = () => {
+        if (!this.shutdownInitiated) {
+          console.error('[SERVER] Parent stdio closed (transport onclose) — shutting down gracefully');
+        }
+        void this.handleShutdown('stdio:transport-close', 0);
+      };
       await this.server.connect(transport);
       console.error('Godot MCP server running on stdio');
 
@@ -6893,11 +6979,21 @@ class GodotServer {
       try {
         await this.godotBridge.start();
         this.bridgeStartupError = null;
+        this.bridgeStartupErrorInfo = null;
         const bridgeStatus = this.godotBridge.getStatus();
-        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}`);
+        const selfTest = bridgeStatus.bridgeSelfTest;
+        const selfTestNote = selfTest === null
+          ? ''
+          : ` (self-test ${selfTest.pass ? `OK in ${selfTest.durationMs}ms` : `FAILED: ${selfTest.error ?? 'unknown'}`})`;
+        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}${selfTestNote}`);
       } catch (bridgeError) {
         const bridgeMessage = bridgeError instanceof Error ? bridgeError.message : String(bridgeError);
         this.bridgeStartupError = bridgeMessage;
+        if (bridgeError instanceof BridgeStartupError) {
+          this.bridgeStartupErrorInfo = bridgeError.info;
+        } else {
+          this.bridgeStartupErrorInfo = null;
+        }
         console.error(`[SERVER] Warning: Godot Editor Bridge failed to start: ${bridgeMessage}`);
         console.error('[SERVER] Continuing without bridge-backed editor tools.');
       }

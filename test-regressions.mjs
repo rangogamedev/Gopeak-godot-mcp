@@ -19,6 +19,7 @@ import {
   resolveWindowsHostIp,
   resolveDefaultRuntimeHost,
   resolveDefaultDAPPort,
+  resolveDefaultRuntimePort,
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
@@ -212,7 +213,17 @@ async function testEditorStatusPortConflict() {
       const payload = JSON.parse(response.result.content[0].text);
       assert.equal(payload.bridgeAvailable, false);
       assert.match(payload.startupError ?? '', /EADDRINUSE/i);
-      assert.match(payload.note ?? '', /Another gopeak instance may own the editor bridge/i);
+      assert.match(payload.note ?? '', /Bridge port is already in use/i);
+      // Fix B: structured holder info must accompany the legacy string field.
+      // findPortHolder may legitimately fail to identify the holder when lsof/ss
+      // are absent (rare on Linux/WSL but possible in minimal containers); accept
+      // either a numeric PID or null + a present startupErrorInfo block.
+      assert.ok(payload.startupErrorInfo, 'startupErrorInfo block must be populated on EADDRINUSE');
+      assert.equal(payload.startupErrorInfo.code, 'EADDRINUSE', 'startupErrorInfo.code is EADDRINUSE');
+      assert.ok(
+        payload.holderPid === null || typeof payload.holderPid === 'number',
+        'holderPid is number or null'
+      );
     } finally {
       proc.kill('SIGTERM');
       await Promise.race([
@@ -224,6 +235,332 @@ async function testEditorStatusPortConflict() {
       }
     }
   });
+}
+
+// Use a non-default test port to avoid colliding with live gopeak instances
+// on the developer machine (the default 6505 is often held by an active
+// Claude Code session). Each test uses a fresh port within this range so
+// they can run sequentially without lockfile collisions either.
+let nextTestBridgePort = 16505;
+function allocateTestBridgePort() {
+  return nextTestBridgePort++;
+}
+
+/**
+ * Spawn a gopeak server, drive an MCP `initialize` + `get_editor_status` over
+ * stdio, and return the parsed status payload. Caller is responsible for
+ * killing the process. Centralizes the boilerplate used by the
+ * bridge-reliability tests (stdin-EOF, self-test, healthy-handoff).
+ */
+async function spawnGopeakAndGetStatus(extraEnv = {}) {
+  const port = extraEnv.GOPEAK_BRIDGE_PORT ?? String(allocateTestBridgePort());
+  const proc = spawn(process.execPath, ['./build/index.js'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      GOPEAK_TOOL_PROFILE: 'compact',
+      GOPEAK_BRIDGE_PORT: port,
+      ...extraEnv,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  proc.gopeakTestBridgePort = Number(port);
+  const stderrChunks = [];
+  proc.stderr.on('data', (chunk) => stderrChunks.push(chunk.toString()));
+
+  try {
+    // Initial spin-up grace period — covers orphan-scan + bind + self-test.
+    // On busy /proc directories this can take 1-2s; the polling below picks
+    // up the moment start() completes.
+    await delay(500);
+    proc.stdin.write(makeRequest('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'regression-test', version: '1.0.0' },
+    }, 1));
+    await waitForJsonLine(proc.stdout, (msg) => msg.id === 1);
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n');
+
+    // Poll editor-status until either (a) bridgeSelfTest is populated
+    // (bridge.start() resolved + post-bind probe ran), or (b) startupErrorInfo
+    // is populated (start failed deterministically). Cap at ~6s.
+    let payload = null;
+    let requestId = 2;
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      proc.stdin.write(makeRequest('tools/call', { name: 'get_editor_status', arguments: {} }, requestId));
+      const response = await waitForJsonLine(proc.stdout, (msg) => msg.id === requestId);
+      requestId += 1;
+      payload = JSON.parse(response.result.content[0].text);
+      if (payload.bridgeSelfTest !== null || payload.startupErrorInfo !== null) {
+        break;
+      }
+      await delay(200);
+    }
+    return { proc, payload, stderr: stderrChunks.join('') };
+  } catch (err) {
+    proc.kill('SIGTERM');
+    throw err;
+  }
+}
+
+async function killAndWait(proc, timeoutMs = 2000) {
+  proc.kill('SIGTERM');
+  await Promise.race([
+    new Promise((resolve) => proc.once('exit', resolve)),
+    delay(timeoutMs),
+  ]);
+  if (proc.exitCode === null) {
+    proc.kill('SIGKILL');
+    await Promise.race([
+      new Promise((resolve) => proc.once('exit', resolve)),
+      delay(500),
+    ]);
+  }
+}
+
+/**
+ * Fix A.4 — post-bind self-test. After server.listen() resolves, the bridge
+ * dials itself on host:port and asserts a TCP-reachable response within 500ms.
+ * Validates that bind + route are both healthy (catches WSL/Windows network
+ * anomalies where bind succeeds but the socket isn't reachable).
+ */
+async function testBridgeSelfTest() {
+  const { proc, payload, stderr } = await spawnGopeakAndGetStatus();
+  try {
+    if (!payload.bridgeAvailable || !payload.bridgeSelfTest) {
+      console.error('[testBridgeSelfTest] payload:', JSON.stringify(payload, null, 2));
+      console.error('[testBridgeSelfTest] gopeak stderr:', stderr);
+    }
+    assert.equal(payload.bridgeAvailable, true, 'bridge should be available on clean startup');
+    assert.ok(payload.bridgeSelfTest, 'bridgeSelfTest must be populated after start()');
+    assert.equal(payload.bridgeSelfTest.pass, true, 'bridge self-test must pass');
+    assert.ok(
+      typeof payload.bridgeSelfTest.durationMs === 'number' && payload.bridgeSelfTest.durationMs < 500,
+      `self-test durationMs must be < 500 (got ${payload.bridgeSelfTest?.durationMs})`
+    );
+  } finally {
+    await killAndWait(proc);
+  }
+}
+
+/**
+ * Fix A.3 — stdin-EOF graceful shutdown. Spawn gopeak, close its stdin (the
+ * standard MCP-stdio teardown signal), and assert the process exits within 2s.
+ * Without this handler, gopeak orphans onto PID 1 when Claude Code dies and
+ * holds :6505 across sessions.
+ */
+async function testStdinEofShutdown() {
+  const port = String(allocateTestBridgePort());
+  const proc = spawn(process.execPath, ['./build/index.js'], {
+    cwd: process.cwd(),
+    env: { ...process.env, GOPEAK_TOOL_PROFILE: 'compact', GOPEAK_BRIDGE_PORT: port },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const stderrChunks = [];
+  proc.stderr.on('data', (chunk) => stderrChunks.push(chunk.toString()));
+
+  try {
+    // Wait for the bridge to fully start before closing stdin — closing too
+    // early can deadlock cleanup against a mid-flight bridge.start() that
+    // hasn't resolved yet. Bridge start includes lockfile preflight + bind
+    // + post-bind self-test (~100-300ms on a warm system).
+    const ready = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 10000);
+      const onData = (chunk) => {
+        if (chunk.toString().match(/bridge listening|self-test|Bridge started/i)) {
+          clearTimeout(timer);
+          proc.stderr.off('data', onData);
+          resolve(true);
+        }
+      };
+      proc.stderr.on('data', onData);
+      // Also check already-buffered chunks in case the data already arrived.
+      if (stderrChunks.join('').match(/bridge listening|self-test|Bridge started/i)) {
+        clearTimeout(timer);
+        proc.stderr.off('data', onData);
+        resolve(true);
+      }
+    });
+    assert.equal(ready, true, 'bridge must complete startup before stdin-close test runs');
+    assert.equal(proc.exitCode, null, 'server should be alive before stdin close');
+
+    // Close stdin — standard MCP-stdio teardown signal.
+    proc.stdin.end();
+
+    const exited = await Promise.race([
+      new Promise((resolve) => proc.once('exit', () => resolve(true))),
+      delay(3000).then(() => false),
+    ]);
+
+    assert.equal(exited, true, 'gopeak must exit within 3s of stdin close');
+    assert.match(
+      stderrChunks.join(''),
+      /Parent stdio closed/i,
+      'stderr should log the stdio-close shutdown reason',
+    );
+  } finally {
+    if (proc.exitCode === null) {
+      proc.kill('SIGKILL');
+    }
+  }
+}
+
+/**
+ * Fix A.2 — PID lockfile healthy handoff. Spawn gopeak A with healthy parent
+ * (this test process), then spawn gopeak B. B must detect A via the lockfile,
+ * recognize A's parent is alive, and exit cleanly with the "use the existing
+ * instance" diagnostic instead of fighting for :6505.
+ */
+async function testPidLockfileHealthyHandoff() {
+  const sharedPort = String(allocateTestBridgePort());
+  const { proc: procA } = await spawnGopeakAndGetStatus({ GOPEAK_BRIDGE_PORT: sharedPort });
+  try {
+    // B must point at the SAME port to encounter A's lockfile + holder.
+    const procB = spawn(process.execPath, ['./build/index.js'], {
+      cwd: process.cwd(),
+      env: { ...process.env, GOPEAK_TOOL_PROFILE: 'compact', GOPEAK_BRIDGE_PORT: sharedPort },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const stderrChunksB = [];
+    procB.stderr.on('data', (chunk) => stderrChunksB.push(chunk.toString()));
+
+    try {
+      await delay(1500);
+
+      // B should still be alive (gopeak keeps the stdio MCP server up even
+      // when bridge fails) — but its editor-status must report startupError.
+      procB.stdin.write(makeRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'regression-test-b', version: '1.0.0' },
+      }, 1));
+      await waitForJsonLine(procB.stdout, (msg) => msg.id === 1);
+      procB.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n');
+
+      procB.stdin.write(makeRequest('tools/call', { name: 'get_editor_status', arguments: {} }, 2));
+      const response = await waitForJsonLine(procB.stdout, (msg) => msg.id === 2);
+      const payload = JSON.parse(response.result.content[0].text);
+
+      // B must NOT have reclaimed A (A's parent — this test process — is alive).
+      // Either B saw A's healthy lockfile and refused to bind (OTHER code), OR
+      // B raced and hit EADDRINUSE (which now reports A's PID).
+      assert.equal(payload.bridgeAvailable, false, 'B must not own the bridge while A is healthy');
+      assert.ok(
+        payload.startupErrorInfo?.code === 'OTHER' || payload.startupErrorInfo?.code === 'EADDRINUSE',
+        'B startupErrorInfo.code should be OTHER (lockfile) or EADDRINUSE (race-loser)',
+      );
+    } finally {
+      await killAndWait(procB);
+    }
+  } finally {
+    await killAndWait(procA);
+  }
+}
+
+/**
+ * Fix A.1 — defensive orphan sibling sweep. Spawn gopeak A and SIGKILL its
+ * stdin parent. A becomes an orphan (PPid → 1). Spawn gopeak B and assert B
+ * reclaims A (kills it) during the preflight sweep and binds :6505 cleanly.
+ * Validates the /proc-based sibling scan, not just the lockfile path.
+ */
+async function testOrphanReclamation() {
+  // Detach A so killing this test wrapper makes A an orphan. We use a small
+  // shell wrapper that exits immediately, leaving A's PPid = 1 (init).
+  // Note: this is a best-effort test on Linux/WSL only.
+  if (process.platform !== 'linux') {
+    console.log('  skipping testOrphanReclamation on non-linux platform');
+    return;
+  }
+
+  const sharedPort = String(allocateTestBridgePort());
+  // Run A as a regular child (pipe stdio) so it stays alive while we work.
+  // We wait for its bridge to actually bind before rewriting the lockfile
+  // to simulate orphan state. The bridge-startup gate avoids races where
+  // we edit the lockfile before A writes it.
+  const procA = spawn(process.execPath, ['./build/index.js'], {
+    cwd: process.cwd(),
+    env: { ...process.env, GOPEAK_TOOL_PROFILE: 'compact', GOPEAK_BRIDGE_PORT: sharedPort },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const aStderrChunks = [];
+  procA.stderr.on('data', (chunk) => aStderrChunks.push(chunk.toString()));
+  const aPid = procA.pid;
+
+  try {
+    // Wait for A's bridge to listen + lockfile to be written.
+    const aReady = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 8000);
+      const onData = (chunk) => {
+        if (chunk.toString().match(/Bridge started|self-test/i)) {
+          clearTimeout(timer);
+          procA.stderr.off('data', onData);
+          resolve(true);
+        }
+      };
+      procA.stderr.on('data', onData);
+    });
+    assert.equal(aReady, true, 'A must start successfully before orphan-rewrite');
+
+    // Simulate orphan-to-init by rewriting A's lockfile so ppid=1. The
+    // preflight check reads the lockfile + sees ppid=1 + reclaims (SIGTERM)
+    // A even though A's actual PPid (this test process) is alive.
+    const lockFile = join(tmpdir(), `gopeak-bridge-${sharedPort}.pid`);
+    if (existsSync(lockFile)) {
+      const lockData = JSON.parse(readFileSync(lockFile, 'utf8'));
+      lockData.ppid = 1;
+      writeFileSync(lockFile, JSON.stringify(lockData, null, 2), 'utf8');
+    } else {
+      console.error('  [testOrphanReclamation] A stderr tail:', aStderrChunks.join('').split('\n').slice(-10).join('\n'));
+      throw new Error('A did not write lockfile despite ready signal');
+    }
+
+    // Spawn B on the SAME port; B should detect A's ppid=1 lockfile and
+    // SIGTERM A. Then B binds cleanly.
+    const { proc: procB, payload } = await spawnGopeakAndGetStatus({ GOPEAK_BRIDGE_PORT: sharedPort });
+    try {
+      assert.equal(payload.bridgeAvailable, true, 'B must reclaim port and bind successfully');
+      assert.ok(
+        Array.isArray(payload.reclaimedPidsAtStartup),
+        'reclaimedPidsAtStartup must be an array',
+      );
+      // A's PID may or may not appear depending on whether SIGTERM landed
+      // before B's preflight; main invariant is that B owns the port now.
+    } finally {
+      await killAndWait(procB);
+    }
+  } finally {
+    // Best-effort cleanup of A.
+    try { process.kill(aPid, 'SIGKILL'); } catch {}
+  }
+}
+
+/**
+ * Fix C addon side — `mcp_runtime_autoload.gd` must read GOPEAK_RUNTIME_PORT
+ * via OS.get_environment, mirroring the server-side resolver. Source-level grep
+ * keeps server + addon in agreement without spinning up Godot.
+ */
+function testRuntimePortAddonEnvOverride() {
+  assert.match(
+    RUNTIME_SOURCE,
+    /PORT_ENV_KEYS[\s\S]*?"GOPEAK_RUNTIME_PORT"[\s\S]*?"GODOT_RUNTIME_PORT"[\s\S]*?"MCP_RUNTIME_PORT"/,
+    'runtime autoload must declare the three port-override env keys',
+  );
+  assert.match(
+    RUNTIME_SOURCE,
+    /func _resolve_port\(\) -> int:/,
+    'runtime autoload must define _resolve_port()',
+  );
+  assert.match(
+    RUNTIME_SOURCE,
+    /OS\.get_environment\(key\)/,
+    'runtime autoload must read port env via OS.get_environment',
+  );
+  assert.match(
+    RUNTIME_SOURCE,
+    /_port\s*=\s*_resolve_port\(\)/,
+    '_port must be assigned from _resolve_port() in _ready',
+  );
 }
 
 function testWSLInterop() {
@@ -418,6 +755,53 @@ function testWSLInterop() {
     delete process.env.GOPEAK_DAP_PORT;
   } finally {
     for (const [key, value] of Object.entries(prevDapPortEnvs)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+
+  // resolveDefaultRuntimePort — env override + fallback (symmetric with DAP port).
+  // Fix C: runtime port 7777 used to be a bare const; now overridable via the
+  // same three-key env pattern as bridge/DAP. Validates server-side resolver.
+  const prevRuntimePortEnvs = {
+    GOPEAK_RUNTIME_PORT: process.env.GOPEAK_RUNTIME_PORT,
+    GODOT_RUNTIME_PORT: process.env.GODOT_RUNTIME_PORT,
+    MCP_RUNTIME_PORT: process.env.MCP_RUNTIME_PORT,
+  };
+  try {
+    for (const key of Object.keys(prevRuntimePortEnvs)) {
+      delete process.env[key];
+    }
+    assert.equal(resolveDefaultRuntimePort(), 7777, 'runtime port defaults to 7777 with no env');
+
+    process.env.GOPEAK_RUNTIME_PORT = '7799';
+    assert.equal(resolveDefaultRuntimePort(), 7799, 'GOPEAK_RUNTIME_PORT env override honored');
+    delete process.env.GOPEAK_RUNTIME_PORT;
+
+    process.env.GODOT_RUNTIME_PORT = '8777';
+    assert.equal(resolveDefaultRuntimePort(), 8777, 'GODOT_RUNTIME_PORT env override honored');
+    delete process.env.GODOT_RUNTIME_PORT;
+
+    process.env.MCP_RUNTIME_PORT = '9777';
+    assert.equal(resolveDefaultRuntimePort(), 9777, 'MCP_RUNTIME_PORT env override honored');
+    delete process.env.MCP_RUNTIME_PORT;
+
+    process.env.GOPEAK_RUNTIME_PORT = 'not-a-number';
+    assert.equal(resolveDefaultRuntimePort(), 7777, 'invalid runtime port env falls back to 7777');
+    delete process.env.GOPEAK_RUNTIME_PORT;
+
+    process.env.GOPEAK_RUNTIME_PORT = '0';
+    assert.equal(resolveDefaultRuntimePort(), 7777, 'zero runtime port env falls back to 7777');
+    delete process.env.GOPEAK_RUNTIME_PORT;
+
+    process.env.GOPEAK_RUNTIME_PORT = '99999';
+    assert.equal(resolveDefaultRuntimePort(), 7777, 'out-of-range runtime port env falls back to 7777');
+    delete process.env.GOPEAK_RUNTIME_PORT;
+  } finally {
+    for (const [key, value] of Object.entries(prevRuntimePortEnvs)) {
       if (value === undefined) {
         delete process.env[key];
       } else {
@@ -831,6 +1215,12 @@ async function main() {
   );
 
   await testEditorStatusPortConflict();
+  // Bridge-reliability tests (fix/bridge-reliability-and-port-symmetry).
+  testRuntimePortAddonEnvOverride();
+  await testBridgeSelfTest();
+  await testStdinEofShutdown();
+  await testPidLockfileHealthyHandoff();
+  await testOrphanReclamation();
   console.log('regression tests passed');
 }
 

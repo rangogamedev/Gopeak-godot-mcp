@@ -7,6 +7,7 @@ extends Node
 const DEFAULT_PORT = 7777
 const PROTOCOL_VERSION = "1.0"
 const DISABLE_ENV = "GOPEAK_RUNTIME_DISABLED"
+const PORT_ENV_KEYS: Array[String] = ["GOPEAK_RUNTIME_PORT", "GODOT_RUNTIME_PORT", "MCP_RUNTIME_PORT"]
 
 var _server: TCPServer
 var _clients: Array[StreamPeerTCP] = []
@@ -21,7 +22,29 @@ signal command_received(command: String, params: Dictionary)
 
 func _ready() -> void:
 	name = "MCPRuntime"
+	_port = _resolve_port()
 	_start_server()
+
+
+## Resolve the runtime listen port. Mirrors resolveDefaultRuntimePort() in
+## src/wsl_interop.ts so the autoload and the MCP server always agree.
+## Env keys are read via OS.get_environment; first valid integer wins.
+## Invalid values emit a warning and fall through to the next key.
+func _resolve_port() -> int:
+	for key in PORT_ENV_KEYS:
+		if not OS.has_environment(key):
+			continue
+		var raw := OS.get_environment(key).strip_edges()
+		if raw.is_empty():
+			continue
+		if not raw.is_valid_int():
+			push_warning("[MCP Runtime] Ignoring invalid %s=\"%s\" — expected integer 1-65535" % [key, raw])
+			continue
+		var parsed := int(raw)
+		if parsed >= 1 and parsed <= 65535:
+			return parsed
+		push_warning("[MCP Runtime] Ignoring out-of-range %s=%d — expected integer 1-65535" % [key, parsed])
+	return DEFAULT_PORT
 
 
 func _process(_delta: float) -> void:
