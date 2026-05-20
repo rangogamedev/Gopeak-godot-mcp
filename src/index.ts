@@ -105,6 +105,7 @@ class GodotServer {
     'editor.stop': 'stop_project',
     'editor.close': 'close_editor',
     'editor.restart': 'restart_editor',
+    'editor.fs_scanning': 'get_fs_scanning_status',
     'editor.debug_output': 'get_debug_output',
     'editor.status': 'get_editor_status',
     'editor.version': 'get_godot_version',
@@ -1772,6 +1773,8 @@ class GodotServer {
           return await this.handleCloseEditor(request.params.arguments);
         case 'restart_editor':
           return await this.handleRestartEditor(request.params.arguments);
+        case 'get_fs_scanning_status':
+          return await this.handleViaBridge('get_fs_scanning_status', request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -2335,13 +2338,29 @@ class GodotServer {
   /**
    * Handle the close_editor tool
    *
-   * Two paths:
-   *  - Path A (preferred): bridge IPC dispatch — addon runs safety guards
-   *    (dirty scenes / fs scanning / modal open) and calls get_tree().quit().
-   *    Respects `force`, `save_first`, `force_kill` flags.
+   * Safety contract (in order):
+   *  - C4: if a game-debug session is active (this.activeProcess), stop it
+   *    first via handleStopProject so its tracking is clean.
+   *  - HITL gate: if the editor was NOT launched by this MCP server
+   *    (this.editorProcess === null) and bridge IS connected (i.e., a user-
+   *    owned editor), refuse by default. Caller must opt-in via force=true
+   *    paired with i_understand_data_loss_risk=true, OR via prefer_pid_kill.
+   *    Prevents AI agents from closing the user's working editor.
+   *  - Force-on-user-editor gate: force=true alone is not enough on a user-
+   *    owned editor; also requires i_understand_data_loss_risk=true.
+   *
+   * Two paths after gates pass:
+   *  - Path A (preferred): bridge IPC dispatch. Addon enforces safety guards
+   *    (fs_scanning, modal_open, save_blocked / writability pre-check) and
+   *    calls get_tree().quit() via call_deferred so the response flushes
+   *    before termination. Respects `force`, `save_first` flags.
    *  - Path B (fallback): direct process.kill() when bridge is disconnected
    *    but `editorProcess` is tracked. SIGTERM by default, SIGKILL if
-   *    `force_kill=true`. Bypasses guards (editor is unresponsive).
+   *    `force_kill=true`. Bypasses GDScript guards (editor is unresponsive).
+   *
+   * editorProcess null transition is owned by spawn's on('exit') listener —
+   * we never null it here on Path A success because the editor hasn't actually
+   * quit at response time (quit is deferred). C2 fix.
    */
   private async handleCloseEditor(args: any): Promise<any> {
     const opts = (args || {}) as {
@@ -2349,27 +2368,87 @@ class GodotServer {
       save_first?: boolean;
       force_kill?: boolean;
       prefer_pid_kill?: boolean;
+      i_understand_data_loss_risk?: boolean;
     };
+
+    // C4: stop active game-debug FIRST so activeProcess tracking is clean.
+    if (this.activeProcess !== null) {
+      this.logDebug('close_editor: stopping active game-debug session first (C4)');
+      try {
+        await this.handleStopProject();
+      } catch {
+        // handleStopProject swallows its own errors and returns a response; on
+        // throw we still want to proceed to the editor close.
+      }
+    }
 
     const bridgeConnected = this.godotBridge.isConnected();
     const hasTrackedPid = this.editorProcess !== null;
+
+    // HITL gates apply only when bridge is connected (i.e., there's actually
+    // an editor to close) and we don't own the editor.
+    if (bridgeConnected && !hasTrackedPid) {
+      const userAcked = opts.i_understand_data_loss_risk === true;
+      const willPidKill = opts.prefer_pid_kill === true;
+      if (!opts.force && !willPidKill) {
+        console.error('[close_editor] HITL refusal: user-owned editor; no force/prefer_pid_kill flag');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              reason: 'user_editor_not_owned_by_mcp',
+              remediation: 'this editor was opened by the user (launched_by_mcp=false). To close it anyway, retry with force=true AND i_understand_data_loss_risk=true. The auto-save guard still runs unless you also pass force=true without save_first.',
+              hint: 'check editor-status.launched_by_mcp to confirm ownership',
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+      if (opts.force === true && !userAcked) {
+        console.error('[close_editor] HITL refusal: force=true on user-owned editor requires explicit data-loss acknowledgement');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              reason: 'force_requires_acknowledgement',
+              remediation: 'force=true on a user-owned editor needs i_understand_data_loss_risk=true paired with it. This is a double-explicit gate to prevent accidental data loss from a misconfigured caller.',
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+
     const usePidKill = (!bridgeConnected && hasTrackedPid) || (opts.prefer_pid_kill === true && hasTrackedPid);
 
     if (usePidKill) {
       // Path B: PID-kill fallback. Guards bypassed (no GDScript-side check).
       const tracked = this.editorProcess!;
+      if (!tracked.process || typeof tracked.process.kill !== 'function') {
+        return this.createErrorResponse(
+          'Tracked editor process handle is invalid; cannot signal.',
+          ['Process may have already exited', 'Check editor-status for current state'],
+        );
+      }
       const signal: NodeJS.Signals = opts.force_kill ? 'SIGKILL' : 'SIGTERM';
-      this.logDebug(`Closing Godot editor via ${signal} (path=pid_kill)`);
+      const bridgeWasAvailable = bridgeConnected;
+      console.error(`[close_editor] path=pid_kill signal=${signal} bridge_was_available=${bridgeWasAvailable} prefer_pid_kill=${opts.prefer_pid_kill === true}`);
       try {
         tracked.process.kill(signal);
       } catch (err) {
         return this.createErrorResponse(
           `Failed to signal Godot editor process: ${err instanceof Error ? err.message : String(err)}`,
-          ['Process may have already exited', 'Check editor-status for current state']
+          ['Process may have already exited', 'Check editor-status for current state'],
         );
       }
       const launchedAtMs = tracked.launchedAt;
-      this.editorProcess = null;
+      // NOTE: do not null editorProcess here — let the on('exit') listener own
+      // the null transition so it fires exactly when the OS reports the exit.
+      const warningText = bridgeWasAvailable
+        ? 'guards bypassed via prefer_pid_kill=true (bridge was available; guards skipped by caller request)'
+        : 'guards bypassed (bridge unavailable); unsaved changes may be lost';
       return {
         content: [{
           type: 'text',
@@ -2377,7 +2456,7 @@ class GodotServer {
             ok: true,
             path: 'pid_kill',
             signal,
-            warning: 'guards bypassed (bridge unavailable); unsaved changes may be lost',
+            warning: warningText,
             launched_at: new Date(launchedAtMs).toISOString(),
           }, null, 2),
         }],
@@ -2396,19 +2475,23 @@ class GodotServer {
     }
 
     // Path A: bridge IPC dispatch. Addon enforces safety guards.
-    this.logDebug(`Closing Godot editor via bridge IPC (path=bridge_ipc, force=${opts.force}, save_first=${opts.save_first})`);
+    console.error(`[close_editor] path=bridge_ipc force=${opts.force === true} save_first=${opts.save_first === true} launched_by_mcp=${hasTrackedPid}`);
     try {
       const result = await this.godotBridge.invokeTool('close_editor', {
         force: opts.force === true,
         save_first: opts.save_first === true,
       });
-      // If the addon reported success, clear our tracked handle so editor-status reflects reality.
       const resultObj = (result && typeof result === 'object') ? (result as Record<string, unknown>) : { value: result };
-      if (resultObj.ok === true && this.editorProcess) {
-        this.editorProcess = null;
-      }
+      const addonReportedOk = resultObj.ok === true;
+      // C2: do NOT null editorProcess here. The addon's get_tree().quit() is
+      // deferred; the editor is still alive when this response arrives. The
+      // spawn on('exit') listener clears editorProcess when the OS reports
+      // the actual exit (line ~2031 in handleLaunchEditor).
       return {
         content: [{ type: 'text', text: JSON.stringify({ path: 'bridge_ipc', ...resultObj }, null, 2) }],
+        // Propagate addon refusals as isError so callers (especially
+        // handleRestartEditor) can detect them without parsing the inner JSON.
+        ...(addonReportedOk ? {} : { isError: true }),
       };
     } catch (err) {
       return {
@@ -2427,20 +2510,32 @@ class GodotServer {
 
   /**
    * Handle the restart_editor tool — close + relaunch.
-   * Inherits guard refusals from inner close_editor; same force / save_first flags.
+   * Inherits guard refusals from inner close_editor (C3: refusal detection
+   * via isError propagation). Forwards force / save_first / force_kill /
+   * i_understand_data_loss_risk so callers can chain through.
    */
   private async handleRestartEditor(args: any): Promise<any> {
     const opts = (args || {}) as {
       projectPath?: string;
       force?: boolean;
       save_first?: boolean;
+      force_kill?: boolean;
+      i_understand_data_loss_risk?: boolean;
     };
     if (!opts.projectPath) {
       return this.createErrorResponse('projectPath required for restart_editor', [
         'Pass the project directory path containing project.godot',
       ]);
     }
-    const closeResult = await this.handleCloseEditor({ force: opts.force, save_first: opts.save_first });
+    const closeResult = await this.handleCloseEditor({
+      force: opts.force,
+      save_first: opts.save_first,
+      force_kill: opts.force_kill,
+      i_understand_data_loss_risk: opts.i_understand_data_loss_risk,
+    });
+    // C3: addon guard refusals (e.g., fs_scanning) now propagate as isError,
+    // so this check correctly stops the restart chain rather than racing into
+    // a launch on top of a still-open editor.
     if ((closeResult as { isError?: boolean }).isError === true) {
       return closeResult;
     }
@@ -2478,6 +2573,7 @@ class GodotServer {
         bridge_reconnected: this.godotBridge.isConnected(),
         editor_pid: this.editorProcess?.process?.pid ?? null,
         launched_at: this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null,
+        project_path: this.editorProcess?.projectPath ?? null,
       }, null, 2) }],
     };
   }

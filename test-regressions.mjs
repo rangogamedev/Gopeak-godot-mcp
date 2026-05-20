@@ -564,8 +564,7 @@ function testEditorLifecycleTracking() {
     'editorProcess field should be declared (parallel to activeProcess) for editor lifecycle tracking',
   );
 
-  // GodotEditorProcess type exists in shared types.
-  // (Asserted by the compile step; double-check the import is wired in index.ts.)
+  // GodotEditorProcess type is imported.
   assert.match(
     INDEX_SOURCE,
     /GodotEditorProcess,/,
@@ -586,7 +585,7 @@ function testEditorLifecycleTracking() {
     'handleLaunchEditor must wire an exit handler that clears editorProcess when the editor dies externally',
   );
 
-  // handleCloseEditor exists and uses both paths.
+  // handleCloseEditor exists with both paths + the HITL gate.
   assert.match(
     INDEX_SOURCE,
     /private async handleCloseEditor\(args: any\)/,
@@ -603,11 +602,70 @@ function testEditorLifecycleTracking() {
     'handleCloseEditor should kill the tracked process on fallback (Path B)',
   );
 
-  // handleRestartEditor exists and polls for bridge state.
+  // C4: activeProcess cleanup before close.
   assert.match(
     INDEX_SOURCE,
-    /private async handleRestartEditor\(args: any\)/,
-    'handleRestartEditor handler should exist',
+    /if \(this\.activeProcess !== null\) \{\s*\n\s*this\.logDebug\('close_editor: stopping active game-debug session first/,
+    'C4: handleCloseEditor must stop activeProcess (game-debug) before closing the editor',
+  );
+
+  // HITL gates.
+  assert.match(
+    INDEX_SOURCE,
+    /reason: 'user_editor_not_owned_by_mcp'/,
+    'HITL: handleCloseEditor must refuse user-owned editors by default',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /reason: 'force_requires_acknowledgement'/,
+    'HITL: handleCloseEditor must require i_understand_data_loss_risk alongside force=true on user-owned editors',
+  );
+
+  // C2: do NOT null editorProcess on Path A ok response.
+  assert.doesNotMatch(
+    INDEX_SOURCE,
+    /addonReportedOk[\s\S]*?this\.editorProcess = null/,
+    'C2: handleCloseEditor must NOT null editorProcess on Path A response — let on(exit) own the null transition',
+  );
+
+  // C3: Path A addon refusals propagate as isError.
+  assert.match(
+    INDEX_SOURCE,
+    /\.\.\.\(addonReportedOk \? \{\} : \{ isError: true \}\)/,
+    'C3: handleCloseEditor must propagate addon ok:false as isError so handleRestartEditor can detect refusals',
+  );
+
+  // I2: Path B null guard.
+  assert.match(
+    INDEX_SOURCE,
+    /!tracked\.process \|\| typeof tracked\.process\.kill !== 'function'/,
+    'I2: Path B must guard against invalid process handle (undefined / no kill method)',
+  );
+
+  // I3: prefer_pid_kill warning text accuracy.
+  assert.match(
+    INDEX_SOURCE,
+    /guards bypassed via prefer_pid_kill=true \(bridge was available; guards skipped by caller request\)/,
+    'I3: prefer_pid_kill warning text must accurately reflect bridge availability',
+  );
+
+  // I4: restart_editor forwards force_kill + i_understand_data_loss_risk.
+  assert.match(
+    INDEX_SOURCE,
+    /force_kill\?: boolean;\s*i_understand_data_loss_risk\?: boolean;\s*\};[\s\S]*?if \(!opts\.projectPath\)/,
+    'I4: handleRestartEditor opts must include force_kill + i_understand_data_loss_risk fields',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /force_kill: opts\.force_kill,\s*\n\s*i_understand_data_loss_risk: opts\.i_understand_data_loss_risk,/,
+    'I4: handleRestartEditor must forward force_kill + i_understand_data_loss_risk into the close call',
+  );
+
+  // M3: restart_editor returns project_path.
+  assert.match(
+    INDEX_SOURCE,
+    /project_path: this\.editorProcess\?\.projectPath/,
+    'M3: handleRestartEditor success response must include project_path',
   );
 
   // Status payload extended.
@@ -638,6 +696,11 @@ function testEditorLifecycleTracking() {
     /'editor\.restart': 'restart_editor'/,
     'compactAliasToLegacy should map editor.restart → restart_editor',
   );
+  assert.match(
+    INDEX_SOURCE,
+    /'editor\.fs_scanning': 'get_fs_scanning_status'/,
+    'compactAliasToLegacy should map editor.fs_scanning → get_fs_scanning_status (I5)',
+  );
 
   // Dispatch switch covers the new tools.
   assert.match(
@@ -649,6 +712,11 @@ function testEditorLifecycleTracking() {
     INDEX_SOURCE,
     /case 'restart_editor':\s*\n\s*return await this\.handleRestartEditor/,
     'tools dispatch switch should route restart_editor to handleRestartEditor',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /case 'get_fs_scanning_status':\s*\n\s*return await this\.handleViaBridge\('get_fs_scanning_status'/,
+    'I5: tools dispatch switch should route get_fs_scanning_status through handleViaBridge',
   );
 
   // Tool schemas exist.
@@ -662,15 +730,25 @@ function testEditorLifecycleTracking() {
     /name: 'restart_editor'/,
     'tool-definitions.ts should register restart_editor schema',
   );
+  assert.match(
+    TOOL_DEFS_SOURCE,
+    /name: 'get_fs_scanning_status'/,
+    'I5: tool-definitions.ts should register get_fs_scanning_status schema',
+  );
+  assert.match(
+    TOOL_DEFS_SOURCE,
+    /i_understand_data_loss_risk: \{ type: 'boolean'/,
+    'HITL: close_editor schema must document i_understand_data_loss_risk',
+  );
 
   // Tool group updated.
   assert.match(
     TOOL_GROUPS_SOURCE,
-    /'close_editor',\s*'restart_editor'/,
-    'core_editor group should include close_editor + restart_editor',
+    /'close_editor',\s*'restart_editor',\s*'get_fs_scanning_status'/,
+    'core_editor group should include close_editor + restart_editor + get_fs_scanning_status',
   );
 
-  // Addon-side handler exists with safety guards.
+  // Addon-side handler exists with all four safety guards.
   assert.match(
     TOOL_EXECUTOR_SOURCE,
     /"close_editor": \[self, "_close_editor"\]/,
@@ -678,9 +756,37 @@ function testEditorLifecycleTracking() {
   );
   assert.match(
     TOOL_EXECUTOR_SOURCE,
+    /"get_fs_scanning_status": \[self, "_get_fs_scanning_status"\]/,
+    'I5: tool_executor.gd _tool_map should route get_fs_scanning_status → self._get_fs_scanning_status',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
     /func _close_editor\(args: Dictionary\) -> Dictionary/,
     '_close_editor handler should be defined',
   );
+  // C1: writability pre-check
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /FileAccess\.open\(abs_path, FileAccess\.READ_WRITE\)/,
+    'C1: _close_editor must probe writability of each open scene before save_all_scenes',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /"reason": "save_blocked"/,
+    'C1: _close_editor must report save_blocked with the offending paths',
+  );
+  // I1: modal-open guard
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /_collect_visible_modals\(base_control, modal_paths, 3\)/,
+    'I1: _close_editor must walk for visible modal dialogs',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /"reason": "modal_open"/,
+    'I1: _close_editor must report modal_open refusal when a visible AcceptDialog blocks',
+  );
+  // fs_scanning + save_all_scenes
   assert.match(
     TOOL_EXECUTOR_SOURCE,
     /is_scanning\(\)/,
@@ -700,6 +806,12 @@ function testEditorLifecycleTracking() {
     TOOL_EXECUTOR_SOURCE,
     /func _perform_editor_quit\(\)[\s\S]*?get_tree\(\)\.quit\(\)/,
     '_perform_editor_quit should call get_tree().quit() to terminate the editor',
+  );
+  // I5: fs scanning probe handler
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /func _get_fs_scanning_status\(_args: Dictionary\) -> Dictionary/,
+    'I5: _get_fs_scanning_status handler should be defined',
   );
 }
 
