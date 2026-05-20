@@ -6,6 +6,7 @@ extends Node
 
 const DEFAULT_PORT = 7777
 const PROTOCOL_VERSION = "1.0"
+const DISABLE_ENV = "GOPEAK_RUNTIME_DISABLED"
 
 var _server: TCPServer
 var _clients: Array[StreamPeerTCP] = []
@@ -21,7 +22,6 @@ signal command_received(command: String, params: Dictionary)
 func _ready() -> void:
 	name = "MCPRuntime"
 	_start_server()
-	print("[MCP Runtime] Autoload ready, server starting on port %d" % _port)
 
 
 func _process(_delta: float) -> void:
@@ -61,11 +61,17 @@ func _process(_delta: float) -> void:
 
 
 func _start_server() -> void:
+	if OS.has_environment(DISABLE_ENV) and OS.get_environment(DISABLE_ENV) == "1":
+		_enabled = false
+		print("[MCP Runtime] Disabled by %s — passive mode (no port bind, no runtime calls)" % DISABLE_ENV)
+		print("[MCP Runtime] To re-enable, unset %s (do NOT set it in shell rc files; restrict to hooks/CI scripts)" % DISABLE_ENV)
+		return
 	_server = TCPServer.new()
 	var error = _server.listen(_port)
 	if error != OK:
-		push_error("[MCP Runtime] Failed to start server on port %d: %s" % [_port, error])
+		push_warning("[MCP Runtime] Bind failed on port %d (error %d) — passive mode (probably second Godot instance holding the port)" % [_port, error])
 		_enabled = false
+		_server = null
 	else:
 		print("[MCP Runtime] Server listening on port %d" % _port)
 
