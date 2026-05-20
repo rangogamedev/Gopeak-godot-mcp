@@ -28,6 +28,9 @@ const INDEX_SOURCE = readFileSync(new URL('./src/index.ts', import.meta.url), 'u
 const CLI_NOTIFY_SOURCE = readFileSync(new URL('./src/cli/notify.ts', import.meta.url), 'utf8');
 const OPERATIONS_SOURCE = readFileSync(new URL('./src/scripts/godot_operations.gd', import.meta.url), 'utf8');
 const RUNTIME_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_runtime/mcp_runtime_autoload.gd', import.meta.url), 'utf8');
+const TOOL_DEFS_SOURCE = readFileSync(new URL('./src/tool-definitions.ts', import.meta.url), 'utf8');
+const TOOL_GROUPS_SOURCE = readFileSync(new URL('./src/tool-groups.ts', import.meta.url), 'utf8');
+const TOOL_EXECUTOR_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/tool_executor.gd', import.meta.url), 'utf8');
 
 function makeRequest(method, params, id) {
   return JSON.stringify({ jsonrpc: '2.0', method, params, id }) + '\n';
@@ -553,12 +556,160 @@ function testRuntimeBindGraceful() {
   );
 }
 
+function testEditorLifecycleTracking() {
+  // editorProcess field declared on the server class.
+  assert.match(
+    INDEX_SOURCE,
+    /private editorProcess: GodotEditorProcess \| null = null/,
+    'editorProcess field should be declared (parallel to activeProcess) for editor lifecycle tracking',
+  );
+
+  // GodotEditorProcess type exists in shared types.
+  // (Asserted by the compile step; double-check the import is wired in index.ts.)
+  assert.match(
+    INDEX_SOURCE,
+    /GodotEditorProcess,/,
+    'GodotEditorProcess type should be imported into index.ts',
+  );
+
+  // handleLaunchEditor saves the spawn handle.
+  assert.match(
+    INDEX_SOURCE,
+    /this\.editorProcess = \{\s*process: editorChild,/,
+    'handleLaunchEditor must save the spawned ChildProcess into this.editorProcess',
+  );
+
+  // process exit handler clears the field automatically (user-closed editor case).
+  assert.match(
+    INDEX_SOURCE,
+    /editorChild\.on\('exit', \(\) => \{\s*if \(this\.editorProcess && this\.editorProcess\.process === editorChild\)/,
+    'handleLaunchEditor must wire an exit handler that clears editorProcess when the editor dies externally',
+  );
+
+  // handleCloseEditor exists and uses both paths.
+  assert.match(
+    INDEX_SOURCE,
+    /private async handleCloseEditor\(args: any\)/,
+    'handleCloseEditor handler should exist',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /this\.godotBridge\.invokeTool\('close_editor'/,
+    'handleCloseEditor should dispatch close_editor over the bridge (Path A)',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /tracked\.process\.kill\(signal\)/,
+    'handleCloseEditor should kill the tracked process on fallback (Path B)',
+  );
+
+  // handleRestartEditor exists and polls for bridge state.
+  assert.match(
+    INDEX_SOURCE,
+    /private async handleRestartEditor\(args: any\)/,
+    'handleRestartEditor handler should exist',
+  );
+
+  // Status payload extended.
+  assert.match(
+    INDEX_SOURCE,
+    /launched_by_mcp: launchedByMcp/,
+    'getEditorStatusPayload should report launched_by_mcp',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /editor_pid: editorPid/,
+    'getEditorStatusPayload should report editor_pid',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /launched_at: launchedAt/,
+    'getEditorStatusPayload should report launched_at',
+  );
+
+  // Aliases registered for compact profile.
+  assert.match(
+    INDEX_SOURCE,
+    /'editor\.close': 'close_editor'/,
+    'compactAliasToLegacy should map editor.close → close_editor',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /'editor\.restart': 'restart_editor'/,
+    'compactAliasToLegacy should map editor.restart → restart_editor',
+  );
+
+  // Dispatch switch covers the new tools.
+  assert.match(
+    INDEX_SOURCE,
+    /case 'close_editor':\s*\n\s*return await this\.handleCloseEditor/,
+    'tools dispatch switch should route close_editor to handleCloseEditor',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /case 'restart_editor':\s*\n\s*return await this\.handleRestartEditor/,
+    'tools dispatch switch should route restart_editor to handleRestartEditor',
+  );
+
+  // Tool schemas exist.
+  assert.match(
+    TOOL_DEFS_SOURCE,
+    /name: 'close_editor'/,
+    'tool-definitions.ts should register close_editor schema',
+  );
+  assert.match(
+    TOOL_DEFS_SOURCE,
+    /name: 'restart_editor'/,
+    'tool-definitions.ts should register restart_editor schema',
+  );
+
+  // Tool group updated.
+  assert.match(
+    TOOL_GROUPS_SOURCE,
+    /'close_editor',\s*'restart_editor'/,
+    'core_editor group should include close_editor + restart_editor',
+  );
+
+  // Addon-side handler exists with safety guards.
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /"close_editor": \[self, "_close_editor"\]/,
+    'tool_executor.gd _tool_map should route close_editor → self._close_editor',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /func _close_editor\(args: Dictionary\) -> Dictionary/,
+    '_close_editor handler should be defined',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /is_scanning\(\)/,
+    '_close_editor should check the resource filesystem scanning guard',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /EditorInterface\.save_all_scenes\(\)/,
+    '_close_editor should auto-save before quit unless force=true',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /call_deferred\("_perform_editor_quit"\)/,
+    '_close_editor should defer the quit so the bridge response flushes first',
+  );
+  assert.match(
+    TOOL_EXECUTOR_SOURCE,
+    /func _perform_editor_quit\(\)[\s\S]*?get_tree\(\)\.quit\(\)/,
+    '_perform_editor_quit should call get_tree().quit() to terminate the editor',
+  );
+}
+
 async function main() {
   testStaleDisconnectRegression();
   testWSLInterop();
   testSceneToolsVectorRegression();
   testStartupActiveGroups();
   testRuntimeBindGraceful();
+  testEditorLifecycleTracking();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');
   assert.match(
