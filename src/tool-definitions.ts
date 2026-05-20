@@ -60,28 +60,39 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         },
         {
           name: 'close_editor',
-          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Preferred path: bridge-IPC dispatch, addon enforces safety guards (refuses on unsaved scenes, fs scanning, modal dialog open). Fallback: PID-kill SIGTERM when bridge is disconnected but editor was launched by this MCP server. Flags: `force` skips guards (LOSES unsaved changes), `save_first` saves all open scenes before quit, `force_kill` escalates SIGTERM to SIGKILL on fallback path. Use after testing to clean up; check editor-status.launched_by_mcp before calling on user-opened editors.',
+          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Three-stage safety: (1) if a game-debug session is active, it is stopped first. (2) HITL gate: if the editor was NOT launched by this MCP server (launched_by_mcp=false), refuses by default — caller must opt in via force=true paired with i_understand_data_loss_risk=true OR via prefer_pid_kill=true. (3) Bridge-IPC path (preferred) enforces addon guards: fs_scanning (FS reimport in progress), modal_open (visible AcceptDialog), save_blocked (any open scene path is read-only). Auto-saves all open scenes before quit by default. Fallback: PID-kill SIGTERM/SIGKILL when bridge is disconnected but editor was launched by this MCP server.',
           inputSchema: {
             type: 'object',
             properties: {
-              force: { type: 'boolean', description: 'Bypass dirty-scenes / fs-scanning / modal-open guards. WARNING: LOSES UNSAVED CHANGES. Use only when you launched the editor yourself for testing.' },
-              save_first: { type: 'boolean', description: 'Call EditorInterface.save_all_scenes() before quitting. Combine with force to bypass remaining guards after save.' },
+              force: { type: 'boolean', description: 'Bypass ALL addon-side guards (fs_scanning, modal_open, save_blocked) AND skip the auto-save unless save_first=true. WARNING: LOSES UNSAVED CHANGES. On a user-owned editor, ALSO requires i_understand_data_loss_risk=true.' },
+              save_first: { type: 'boolean', description: 'Keep the auto-save even when force=true. Combine to mean "save anyway, then quit forcefully past the other guards".' },
               force_kill: { type: 'boolean', description: 'On PID-kill fallback path, send SIGKILL instead of SIGTERM. Last-resort for stuck editors.' },
-              prefer_pid_kill: { type: 'boolean', description: 'Advanced: prefer Path B (PID kill) even when bridge is connected. Bypasses GDScript guards. Not recommended.' },
+              prefer_pid_kill: { type: 'boolean', description: 'Advanced: prefer Path B (PID kill) even when bridge is connected. Bypasses GDScript guards. Skips the HITL refusal because the PID-kill path can\'t close user-owned editors anyway (no tracked PID). Not recommended.' },
+              i_understand_data_loss_risk: { type: 'boolean', description: 'Required alongside force=true on a user-owned editor (launched_by_mcp=false). Double-explicit gate; prevents accidental data loss from a misconfigured caller. Has no effect on MCP-launched editors (those are safe to force-close).' },
             },
           },
         },
         {
           name: 'restart_editor',
-          description: 'Closes then relaunches the Godot Editor for the specified project. Composes close_editor + launch_editor with bridge-disconnect (5s) and reconnect (15s) polling between. Inherits guard refusals from close_editor; pass `force` and `save_first` through if needed. Use when iterating on plugin code or recovering from a stuck editor state.',
+          description: 'Closes then relaunches the Godot Editor for the specified project. Composes close_editor + launch_editor with bridge-disconnect (5s) and reconnect (15s) polling between. Inherits guard refusals from close_editor (refusals propagate via isError). Forwards force / save_first / force_kill / i_understand_data_loss_risk so a single call can recover from a stuck editor. Use when iterating on plugin code or recovering from a stuck editor state.',
           inputSchema: {
             type: 'object',
             properties: {
               projectPath: { type: 'string', description: 'Absolute path to project directory containing project.godot.' },
-              force: { type: 'boolean', description: 'Forwarded to close_editor — bypass safety guards.' },
-              save_first: { type: 'boolean', description: 'Forwarded to close_editor — save all scenes before quit.' },
+              force: { type: 'boolean', description: 'Forwarded to close_editor — bypass safety guards (fs_scanning, modal_open, save_blocked). WARNING: LOSES UNSAVED CHANGES on a user-owned editor unless paired with i_understand_data_loss_risk.' },
+              save_first: { type: 'boolean', description: 'Forwarded to close_editor — keep auto-save even when force=true.' },
+              force_kill: { type: 'boolean', description: 'Forwarded to close_editor — on PID-kill fallback, send SIGKILL instead of SIGTERM.' },
+              i_understand_data_loss_risk: { type: 'boolean', description: 'Required alongside force=true on a user-owned editor (launched_by_mcp=false). Double-explicit gate; prevents accidental data loss from misconfigured callers.' },
             },
             required: ['projectPath'],
+          },
+        },
+        {
+          name: 'get_fs_scanning_status',
+          description: 'Probe the Godot editor\'s resource filesystem to see if a scan/reimport is in progress. Returns { ok: true, is_scanning: bool }. Use to poll between fs_scanning refusals from close_editor — when is_scanning flips to false, the close is safe to retry.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
           },
         },
         {

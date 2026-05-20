@@ -5,8 +5,10 @@ export interface GodotProcess {
   launchedAt: number;
 }
 
+import type { ChildProcess } from 'node:child_process';
+
 export interface GodotEditorProcess {
-  process: any;
+  process: ChildProcess;
   projectPath: string;
   launchedAt: number;
 }
