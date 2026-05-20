@@ -504,11 +504,61 @@ function testStartupActiveGroups() {
   });
 }
 
+function testRuntimeBindGraceful() {
+  // The env-gate constant is declared so consumers can grep for the canonical name.
+  assert.match(
+    RUNTIME_SOURCE,
+    /const DISABLE_ENV = "GOPEAK_RUNTIME_DISABLED"/,
+    'runtime autoload should declare DISABLE_ENV constant for the gate',
+  );
+
+  // _start_server short-circuits when env=="1" — explicit equality, no truthy-string semantics.
+  assert.match(
+    RUNTIME_SOURCE,
+    /OS\.has_environment\(DISABLE_ENV\)\s+and\s+OS\.get_environment\(DISABLE_ENV\) == "1"/,
+    'runtime autoload should gate _start_server on DISABLE_ENV == "1" (literal, no truthy match)',
+  );
+
+  // Passive mode print on the disabled path so users see why the runtime is silent.
+  assert.match(
+    RUNTIME_SOURCE,
+    /Disabled by .* passive mode/,
+    'runtime autoload should print a passive-mode notice when DISABLE_ENV is set',
+  );
+
+  // Helpful diagnostic so users know not to put the env in shell rc files.
+  assert.match(
+    RUNTIME_SOURCE,
+    /do NOT set it in shell rc files/,
+    'runtime autoload should warn against setting DISABLE_ENV in shell rc files',
+  );
+
+  // Bind failure is a WARNING, not an ERROR — smoke gates that fail on ERROR: lines stay clean.
+  assert.match(
+    RUNTIME_SOURCE,
+    /push_warning\(\s*"\[MCP Runtime\] Bind failed/,
+    'runtime autoload should emit push_warning (not push_error) on bind failure',
+  );
+  assert.doesNotMatch(
+    RUNTIME_SOURCE,
+    /push_error\(\s*"\[MCP Runtime\] (Failed to start server|Bind failed)/,
+    'runtime autoload must NOT emit push_error on bind failure (would taint smoke gates)',
+  );
+
+  // Disabled-path nulls _server so _process early-return on `_server == null` covers it.
+  assert.match(
+    RUNTIME_SOURCE,
+    /_enabled = false\s*\n\s*_server = null/,
+    'runtime autoload should null _server alongside _enabled=false on bind failure (already guarded in _process)',
+  );
+}
+
 async function main() {
   testStaleDisconnectRegression();
   testWSLInterop();
   testSceneToolsVectorRegression();
   testStartupActiveGroups();
+  testRuntimeBindGraceful();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');
   assert.match(
