@@ -5,6 +5,12 @@ export interface GodotProcess {
   launchedAt: number;
 }
 
+export interface GodotEditorProcess {
+  process: any;
+  projectPath: string;
+  launchedAt: number;
+}
+
 export interface WSLInteropDetails {
   isWSL: boolean;
   windowsTarget: boolean;

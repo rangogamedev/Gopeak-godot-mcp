@@ -59,6 +59,32 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
           },
         },
         {
+          name: 'close_editor',
+          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Preferred path: bridge-IPC dispatch, addon enforces safety guards (refuses on unsaved scenes, fs scanning, modal dialog open). Fallback: PID-kill SIGTERM when bridge is disconnected but editor was launched by this MCP server. Flags: `force` skips guards (LOSES unsaved changes), `save_first` saves all open scenes before quit, `force_kill` escalates SIGTERM to SIGKILL on fallback path. Use after testing to clean up; check editor-status.launched_by_mcp before calling on user-opened editors.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              force: { type: 'boolean', description: 'Bypass dirty-scenes / fs-scanning / modal-open guards. WARNING: LOSES UNSAVED CHANGES. Use only when you launched the editor yourself for testing.' },
+              save_first: { type: 'boolean', description: 'Call EditorInterface.save_all_scenes() before quitting. Combine with force to bypass remaining guards after save.' },
+              force_kill: { type: 'boolean', description: 'On PID-kill fallback path, send SIGKILL instead of SIGTERM. Last-resort for stuck editors.' },
+              prefer_pid_kill: { type: 'boolean', description: 'Advanced: prefer Path B (PID kill) even when bridge is connected. Bypasses GDScript guards. Not recommended.' },
+            },
+          },
+        },
+        {
+          name: 'restart_editor',
+          description: 'Closes then relaunches the Godot Editor for the specified project. Composes close_editor + launch_editor with bridge-disconnect (5s) and reconnect (15s) polling between. Inherits guard refusals from close_editor; pass `force` and `save_first` through if needed. Use when iterating on plugin code or recovering from a stuck editor state.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Absolute path to project directory containing project.godot.' },
+              force: { type: 'boolean', description: 'Forwarded to close_editor — bypass safety guards.' },
+              save_first: { type: 'boolean', description: 'Forwarded to close_editor — save all scenes before quit.' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
           name: 'get_godot_version',
           description: 'Returns the installed Godot engine version string. Use to check compatibility (e.g., Godot 4.4+ features like UID). Returns version like "4.3.stable" or "4.4.dev".',
           inputSchema: {

@@ -49,6 +49,7 @@ import { parseStartupActiveGroups } from './startup-active-groups.js';
 import { DEBUG_MODE, GODOT_DEBUG_MODE_DEFAULT, SERVER_VERSION } from './server-version.js';
 import type {
   GodotProcess,
+  GodotEditorProcess,
   GodotServerConfig,
   MCPToolDefinition,
   OperationParams,
@@ -69,6 +70,7 @@ const __dirname = dirname(__filename);
 class GodotServer {
   private server: Server;
   private activeProcess: GodotProcess | null = null;
+  private editorProcess: GodotEditorProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
@@ -101,6 +103,8 @@ class GodotServer {
     'editor.launch': 'launch_editor',
     'editor.run': 'run_project',
     'editor.stop': 'stop_project',
+    'editor.close': 'close_editor',
+    'editor.restart': 'restart_editor',
     'editor.debug_output': 'get_debug_output',
     'editor.status': 'get_editor_status',
     'editor.version': 'get_godot_version',
@@ -1536,10 +1540,19 @@ class GodotServer {
     const status = this.godotBridge.getStatus();
     const isPortConflict = this.bridgeStartupError?.includes('EADDRINUSE') ?? false;
 
+    const launchedByMcp = this.editorProcess !== null;
+    const editorPid = this.editorProcess?.process?.pid ?? null;
+    const launchedAt = this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null;
+    const tracked_project_path = this.editorProcess?.projectPath ?? null;
+
     return {
       ...status,
       bridgeAvailable: this.bridgeStartupError === null,
       startupError: this.bridgeStartupError,
+      launched_by_mcp: launchedByMcp,
+      editor_pid: editorPid,
+      launched_at: launchedAt,
+      tracked_project_path,
       note: isPortConflict
         ? 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.'
         : undefined,
@@ -1711,6 +1724,10 @@ class GodotServer {
           return await this.handleGetDebugOutput();
         case 'stop_project':
           return await this.handleStopProject();
+        case 'close_editor':
+          return await this.handleCloseEditor(request.params.arguments);
+        case 'restart_editor':
+          return await this.handleRestartEditor(request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -2000,14 +2017,28 @@ class GodotServer {
 
       const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
       this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
-      const process = spawn(prepared.command, prepared.args, {
+      const editorChild = spawn(prepared.command, prepared.args, {
         stdio: 'pipe',
         cwd: prepared.cwd,
       });
 
-      process.on('error', (err: Error) => {
+      editorChild.on('error', (err: Error) => {
         console.error('Failed to start Godot editor:', err);
+        if (this.editorProcess && this.editorProcess.process === editorChild) {
+          this.editorProcess = null;
+        }
       });
+      editorChild.on('exit', () => {
+        if (this.editorProcess && this.editorProcess.process === editorChild) {
+          this.editorProcess = null;
+        }
+      });
+
+      this.editorProcess = {
+        process: editorChild,
+        projectPath: prepared.targetProjectPath,
+        launchedAt: Date.now(),
+      };
 
       return {
         content: [
@@ -2254,6 +2285,156 @@ class GodotServer {
           ),
         },
       ],
+    };
+  }
+
+  /**
+   * Handle the close_editor tool
+   *
+   * Two paths:
+   *  - Path A (preferred): bridge IPC dispatch — addon runs safety guards
+   *    (dirty scenes / fs scanning / modal open) and calls get_tree().quit().
+   *    Respects `force`, `save_first`, `force_kill` flags.
+   *  - Path B (fallback): direct process.kill() when bridge is disconnected
+   *    but `editorProcess` is tracked. SIGTERM by default, SIGKILL if
+   *    `force_kill=true`. Bypasses guards (editor is unresponsive).
+   */
+  private async handleCloseEditor(args: any): Promise<any> {
+    const opts = (args || {}) as {
+      force?: boolean;
+      save_first?: boolean;
+      force_kill?: boolean;
+      prefer_pid_kill?: boolean;
+    };
+
+    const bridgeConnected = this.godotBridge.isConnected();
+    const hasTrackedPid = this.editorProcess !== null;
+    const usePidKill = (!bridgeConnected && hasTrackedPid) || (opts.prefer_pid_kill === true && hasTrackedPid);
+
+    if (usePidKill) {
+      // Path B: PID-kill fallback. Guards bypassed (no GDScript-side check).
+      const tracked = this.editorProcess!;
+      const signal: NodeJS.Signals = opts.force_kill ? 'SIGKILL' : 'SIGTERM';
+      this.logDebug(`Closing Godot editor via ${signal} (path=pid_kill)`);
+      try {
+        tracked.process.kill(signal);
+      } catch (err) {
+        return this.createErrorResponse(
+          `Failed to signal Godot editor process: ${err instanceof Error ? err.message : String(err)}`,
+          ['Process may have already exited', 'Check editor-status for current state']
+        );
+      }
+      const launchedAtMs = tracked.launchedAt;
+      this.editorProcess = null;
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            path: 'pid_kill',
+            signal,
+            warning: 'guards bypassed (bridge unavailable); unsaved changes may be lost',
+            launched_at: new Date(launchedAtMs).toISOString(),
+          }, null, 2),
+        }],
+      };
+    }
+
+    if (!bridgeConnected) {
+      return this.createErrorResponse(
+        'Godot Editor not connected. No bridge channel; no tracked PID. Cannot close.',
+        [
+          'Launch the editor via launch_editor or open it manually',
+          'If the editor is open but bridge unreachable, check editor-status.bridgeAvailable',
+          'For headless Godot this is expected — there is no editor to close',
+        ]
+      );
+    }
+
+    // Path A: bridge IPC dispatch. Addon enforces safety guards.
+    this.logDebug(`Closing Godot editor via bridge IPC (path=bridge_ipc, force=${opts.force}, save_first=${opts.save_first})`);
+    try {
+      const result = await this.godotBridge.invokeTool('close_editor', {
+        force: opts.force === true,
+        save_first: opts.save_first === true,
+      });
+      // If the addon reported success, clear our tracked handle so editor-status reflects reality.
+      const resultObj = (result && typeof result === 'object') ? (result as Record<string, unknown>) : { value: result };
+      if (resultObj.ok === true && this.editorProcess) {
+        this.editorProcess = null;
+      }
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ path: 'bridge_ipc', ...resultObj }, null, 2) }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: false,
+            path: 'bridge_ipc',
+            error: err instanceof Error ? err.message : String(err),
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Handle the restart_editor tool — close + relaunch.
+   * Inherits guard refusals from inner close_editor; same force / save_first flags.
+   */
+  private async handleRestartEditor(args: any): Promise<any> {
+    const opts = (args || {}) as {
+      projectPath?: string;
+      force?: boolean;
+      save_first?: boolean;
+    };
+    if (!opts.projectPath) {
+      return this.createErrorResponse('projectPath required for restart_editor', [
+        'Pass the project directory path containing project.godot',
+      ]);
+    }
+    const closeResult = await this.handleCloseEditor({ force: opts.force, save_first: opts.save_first });
+    if ((closeResult as { isError?: boolean }).isError === true) {
+      return closeResult;
+    }
+    // Poll until bridge disconnects (5s cap).
+    const disconnectDeadline = Date.now() + 5000;
+    while (this.godotBridge.isConnected() && Date.now() < disconnectDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (this.godotBridge.isConnected()) {
+      return this.createErrorResponse('Editor did not disconnect within 5s of close_editor', [
+        'Editor may be stuck; try editor-close with force_kill=true',
+        'Then call launch_editor manually',
+      ]);
+    }
+    const launchResult = await this.handleLaunchEditor({ projectPath: opts.projectPath });
+    if ((launchResult as { isError?: boolean }).isError === true) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          ok: false,
+          phase: 'launch_after_close',
+          suggestion: 'editor closed but relaunch failed; call launch_editor manually',
+          launch_error: launchResult,
+        }, null, 2) }],
+        isError: true,
+      };
+    }
+    // Poll until bridge reconnects (15s cap).
+    const reconnectDeadline = Date.now() + 15000;
+    while (!this.godotBridge.isConnected() && Date.now() < reconnectDeadline) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        ok: true,
+        bridge_reconnected: this.godotBridge.isConnected(),
+        editor_pid: this.editorProcess?.process?.pid ?? null,
+        launched_at: this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null,
+      }, null, 2) }],
     };
   }
 

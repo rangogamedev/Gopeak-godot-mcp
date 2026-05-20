@@ -89,8 +89,76 @@ func _init_tools() -> void:
 		"add_animation_state": [_animation_tools, "add_animation_state"],
 		"connect_animation_states": [_animation_tools, "connect_animation_states"],
 		"create_navigation_region": [_animation_tools, "create_navigation_region"],
-		"create_navigation_agent": [_animation_tools, "create_navigation_agent"]
+		"create_navigation_agent": [_animation_tools, "create_navigation_agent"],
+
+		# Lifecycle tools
+		"close_editor": [self, "_close_editor"]
 	}
+
+
+## Close the Godot Editor.
+##
+## Args (all optional):
+##   force (bool):       Skip safety guards (is_scanning) AND skip the
+##                       auto-save-before-quit. WARNING: LOSES UNSAVED CHANGES.
+##                       Default false.
+##   save_first (bool):  No-op today — auto-save is the default. Accepted for
+##                       API symmetry with the MCP side; documented as default.
+##                       Default false.
+##
+## Behavior:
+##   1. If resource filesystem is scanning/importing, refuse unless force=true
+##      (would corrupt .godot/ cache).
+##   2. Unless force=true, call EditorInterface.save_all_scenes(). No-op on
+##      clean scenes; saves dirty ones. Prevents silent data loss.
+##   3. Reply to the bridge with ok:true, then call_deferred the actual quit
+##      so the response flushes before the editor dies.
+func _close_editor(args: Dictionary) -> Dictionary:
+	var force: bool = bool(args.get("force", false))
+	# `save_first` is accepted for symmetry but the default IS save_first behavior;
+	# it only matters when combined with force=true (force overrides the auto-save).
+	var save_first: bool = bool(args.get("save_first", false))
+
+	var bypassed_guards: Array = []
+	var actions_taken: Array = []
+
+	# Guard 1: filesystem scanning / reimport in progress.
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs != null and fs.is_scanning():
+		if not force:
+			return {
+				"ok": false,
+				"reason": "fs_scanning",
+				"remediation": "wait for import to complete (poll editor-status), OR retry with force=true (may corrupt .godot/ cache)"
+			}
+		bypassed_guards.append("fs_scanning")
+
+	# Auto-save (default ON; force=true skips). save_first=true with force=true
+	# means "save anyway, then quit forcefully".
+	if not force or save_first:
+		EditorInterface.save_all_scenes()
+		actions_taken.append("save_all_scenes")
+	else:
+		bypassed_guards.append("save_all_scenes")
+
+	# Defer the quit so this response can flush over the bridge first.
+	call_deferred("_perform_editor_quit")
+
+	var response: Dictionary = {
+		"ok": true,
+		"actions": actions_taken,
+		"deferred_quit": true
+	}
+	if not bypassed_guards.is_empty():
+		response["bypassed_guards"] = bypassed_guards
+		response["warning"] = "guards bypassed via force=true"
+	return response
+
+
+func _perform_editor_quit() -> void:
+	# get_tree().quit() in editor-plugin context terminates the editor process
+	# after the current frame. Plugin tear-down runs normally; no save prompt.
+	get_tree().quit()
 
 
 func execute_tool(tool_name: String, args: Dictionary) -> Dictionary:
