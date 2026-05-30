@@ -215,6 +215,35 @@ GoPeak also exposes two CLI bin names:
 - `gopeak`
 - `godot-mcp`
 
+### D) WSL (Windows Subsystem for Linux) — run from the native Linux filesystem
+
+**Do not run the server from a `/mnt/c` Windows path under WSL.** Loading `node_modules` from
+the `/mnt/c` 9p mount (made worse by Windows Defender scanning each file open) takes ~20–40s,
+which exceeds Claude Code's hard **30s MCP `initialize` timeout**. The server is then marked
+failed and must be reconnected with `/mcp` on every fresh session. Running the *same* build from
+a native Linux (ext4) path drops cold start to well under 1s and removes the reconnect entirely.
+
+Keep the runnable copy under `$HOME` (ext4) — a git worktree is convenient — then register it at
+**user scope** so every project/worktree inherits it:
+
+```bash
+# from your /mnt/c checkout (or clone fresh under $HOME):
+git worktree add ~/gopeak-wsl -b wsl-runtime wsl-windows-compat
+cd ~/gopeak-wsl
+npm install && npm run build
+
+# point Claude Code at the ext4 build (set GODOT_PATH to your Windows Godot .exe):
+claude mcp add godot -s user \
+  -e GODOT_PATH="/mnt/c/path/to/Godot_<ver>_win64.exe" \
+  -e GOPEAK_TOOL_PROFILE=compact \
+  -e GOPEAK_STARTUP_ACTIVE_GROUPS=dap,lsp,runtime \
+  -- node "$HOME/gopeak-wsl/build/index.js"
+```
+
+After updating, rebuild in place: `cd ~/gopeak-wsl && git merge wsl-windows-compat && npm install && npm run build`. The worktree branch has no upstream, so `git pull` won't work — first refresh your base branch (e.g. `git pull` in your `/mnt/c` checkout, or `git fetch` for a standalone clone), then merge or rebase it in.
+WSL→Windows connectivity (editor bridge on `0.0.0.0:6505`, LSP/DAP/runtime host resolution) is
+unaffected by the filesystem location. Or run `bash scripts/wsl-setup.sh`, which builds and prints the `claude mcp add` command for you to paste (it does not register anything itself).
+
 ---
 
 ## Documentation
@@ -372,6 +401,7 @@ Visualize your entire project architecture with `visualizer.map` (`map_project` 
 - **Runtime tools not working** → install/enable runtime addon plugin
 - **Need a tool that is not visible** → run `tool.catalog` to search and auto-activate matching groups, or use `tool.groups` to activate a specific group
 - **`get_editor_status` says disconnected while the Godot editor shows connected** → check whether another `gopeak`/MCP server instance already owns bridge port `6505`; the status payload now reports the startup error and suggests stopping duplicate servers
+- **(WSL) MCP server times out / needs `/mcp` reconnect on almost every fresh session** → you are launching the server from a `/mnt/c` (9p) path, whose slow `node_modules` load exceeds Claude Code's 30s `initialize` timeout. Run it from the native Linux filesystem instead — see [Installation → D) WSL](#d-wsl-windows-subsystem-for-linux--run-from-the-native-linux-filesystem)
 
 ---
 
