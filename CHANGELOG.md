@@ -4,6 +4,12 @@ All notable changes to GoPeak (godot-mcp) will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **WSL: MCP server required a `/mcp` reconnect on nearly every fresh session.** Root cause was launching `node build/index.js` from a `/mnt/c` 9p mount, where loading `node_modules` (worsened by Windows Defender scanning) took ~20–40s and exceeded Claude Code's hard 30s `initialize` timeout. Fix is to run the (unchanged) build from the native Linux ext4 filesystem, dropping cold start to <1s. No server code changes — see README → Installation → D) WSL and `scripts/wsl-setup.sh`.
+
+### Added
+- `scripts/wsl-setup.sh`: helper that builds the server on the native Linux filesystem and prints the `claude mcp add -s user` command to register it (for WSL users avoiding the `/mnt/c` cold-start timeout).
+
 ## [2.3.7] - 2026-05-14
 
 ### Changed
