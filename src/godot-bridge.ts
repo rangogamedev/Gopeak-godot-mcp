@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
-import { release } from 'node:os';
+import { createConnection as createNetConnection } from 'node:net';
+import { release, tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
+import { execSync } from 'node:child_process';
 import type { RawData } from 'ws';
 import { WebSocket, WebSocketServer } from 'ws';
 
@@ -10,7 +13,11 @@ const DEFAULT_PORT = 6505;
 const DEFAULT_HOST = process.platform === 'linux' && release().toLowerCase().includes('microsoft') ? '0.0.0.0' : '127.0.0.1';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 10_000;
-const SECOND_CONNECTION_CLOSE_CODE = 4000;
+// Evict a Godot socket after this many consecutive keepalive intervals with no
+// pong. At the default 10s interval that's ~30s of silence. The counter is only
+// advanced while no tool is in flight (see startKeepalive), so a long
+// synchronous editor tool that blocks Godot's main thread can't trip it.
+const PONG_MISS_LIMIT = 3;
 const BRIDGE_PORT_ENV_KEYS = ['GODOT_BRIDGE_PORT', 'MCP_BRIDGE_PORT', 'GOPEAK_BRIDGE_PORT'] as const;
 const BRIDGE_HOST_ENV_KEYS = ['GODOT_BRIDGE_HOST', 'MCP_BRIDGE_HOST', 'GOPEAK_BRIDGE_HOST'] as const;
 const BRIDGE_VERSION = (() => {
@@ -54,6 +61,358 @@ function resolveDefaultBridgeHost(): string {
   }
 
   return DEFAULT_HOST;
+}
+
+// ============================================
+// Bridge reliability helpers (orphan reclaim, PID lockfile, self-test, port-holder lookup)
+// See plan: docs/plans/2026-05-20-mcp-bridge-reliability.md and feedback memory
+// feedback_mcp_bridge_reliability — the bridge must work every session.
+// ============================================
+
+export interface BridgePidLockData {
+  pid: number;
+  ppid: number;
+  startedAt: string;
+  port: number;
+  host: string;
+  version: string;
+}
+
+export interface BridgeSelfTest {
+  pass: boolean;
+  durationMs: number;
+  error?: string;
+}
+
+export interface BridgeStartupErrorInfo {
+  code: 'EADDRINUSE' | 'SELF_TEST_FAILED' | 'OTHER';
+  message: string;
+  holderPid: number | null;
+  holderCommand: string | null;
+  reclaimedPids: number[];
+}
+
+export class BridgeStartupError extends Error {
+  public readonly info: BridgeStartupErrorInfo;
+  constructor(info: BridgeStartupErrorInfo) {
+    super(info.message);
+    this.name = 'BridgeStartupError';
+    this.info = info;
+  }
+}
+
+function bridgePidFilePath(port: number): string {
+  return joinPath(tmpdir(), `gopeak-bridge-${port}.pid`);
+}
+
+function readBridgePidFile(port: number): BridgePidLockData | null {
+  const file = bridgePidFilePath(port);
+  if (!existsSync(file)) {
+    return null;
+  }
+  try {
+    const raw = readFileSync(file, 'utf8');
+    const data = JSON.parse(raw) as Partial<BridgePidLockData>;
+    if (typeof data.pid !== 'number' || typeof data.ppid !== 'number' || typeof data.port !== 'number') {
+      return null;
+    }
+    return data as BridgePidLockData;
+  } catch {
+    return null;
+  }
+}
+
+function writeBridgePidFile(port: number, data: BridgePidLockData): void {
+  try {
+    writeFileSync(bridgePidFilePath(port), JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) {
+    console.error(`[GodotBridge] Failed to write PID lockfile: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function tryUnlinkBridgePidFile(port: number, ownerPid: number): void {
+  const file = bridgePidFilePath(port);
+  try {
+    if (!existsSync(file)) {
+      return;
+    }
+    const data = readBridgePidFile(port);
+    if (data && data.pid !== ownerPid) {
+      // Don't remove another instance's lockfile.
+      return;
+    }
+    unlinkSync(file);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function readPpidFromProc(pid: number): number | null {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    const match = status.match(/^PPid:\s+(\d+)/m);
+    if (!match) {
+      return null;
+    }
+    return Number.parseInt(match[1], 10);
+  } catch {
+    return null;
+  }
+}
+
+function readCmdlineFromProc(pid: number): string[] | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`);
+    const parts = raw.toString('utf8').split('\0').filter((s) => s.length > 0);
+    return parts.length > 0 ? parts : null;
+  } catch {
+    return null;
+  }
+}
+
+function isGopeakProcess(cmdline: string[] | null): boolean {
+  if (!cmdline || cmdline.length === 0) {
+    return false;
+  }
+  return cmdline.some((arg) => arg.endsWith('build/index.js') || arg.endsWith('/gopeak') || arg.endsWith('godot-mcp'));
+}
+
+function readCommFromProc(pid: number): string | null {
+  try {
+    return readFileSync(`/proc/${pid}/comm`, 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Scan /proc for sibling gopeak node processes whose parent (PPid) is dead
+ * or PID 1 (orphan adopted by init). Returns candidates safe to reclaim.
+ * On non-Linux platforms returns []. Skips the current process.
+ *
+ * Optimized two-pass scan: filter by /proc/PID/comm (1-byte read, just the
+ * process name) before paying the cost of /proc/PID/cmdline + /proc/PID/status.
+ * On busy systems with 500+ PIDs, this drops scan time from ~2s to ~50ms.
+ */
+function findOrphanGopeakPids(): Array<{ pid: number; ppid: number; cmdline: string[] }> {
+  if (process.platform !== 'linux') {
+    return [];
+  }
+  const selfPid = process.pid;
+  const orphans: Array<{ pid: number; ppid: number; cmdline: string[] }> = [];
+
+  let entries: string[];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) {
+      continue;
+    }
+    const pid = Number.parseInt(entry, 10);
+    if (pid === selfPid) {
+      continue;
+    }
+    // Fast filter: only consider node processes (comm == "node").
+    // Skips ~99% of /proc entries with a single small file read.
+    const comm = readCommFromProc(pid);
+    if (comm !== 'node') {
+      continue;
+    }
+    const cmdline = readCmdlineFromProc(pid);
+    if (!isGopeakProcess(cmdline)) {
+      continue;
+    }
+    const ppid = readPpidFromProc(pid);
+    if (ppid === null) {
+      continue;
+    }
+    // Orphan if ppid is 1 (init) or the parent process is gone.
+    if (ppid === 1 || !isProcessAlive(ppid)) {
+      orphans.push({ pid, ppid, cmdline: cmdline! });
+    }
+  }
+  return orphans;
+}
+
+/**
+ * Poll the OS until the given host:port is bindable. Used after reclaiming
+ * a process holding the port to close the narrow window where the process
+ * is gone but the kernel still has the socket in close-wait / TIME_WAIT.
+ * Resolves true when the port is free, false when the timeout elapses.
+ */
+async function waitForPortFree(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
+  const probeHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const isFree = await new Promise<boolean>((resolve) => {
+      const socket = createNetConnection({ host: probeHost, port }, () => {
+        // Connection succeeded means SOMETHING is listening — port not free.
+        socket.destroy();
+        resolve(false);
+      });
+      socket.once('error', (err) => {
+        socket.destroy();
+        // ECONNREFUSED = nothing listening = port free.
+        resolve((err as NodeJS.ErrnoException).code === 'ECONNREFUSED');
+      });
+    });
+    if (isFree) {
+      return true;
+    }
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  return false;
+}
+
+/**
+ * Send SIGTERM, wait up to `timeoutMs` for the process to exit, then SIGKILL.
+ * Resolves to true if the process is gone by the end, false otherwise.
+ */
+async function reclaimProcess(pid: number, timeoutMs = 2000): Promise<boolean> {
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+
+  const pollIntervalMs = 100;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      return true;
+    }
+    await new Promise((res) => setTimeout(res, pollIntervalMs));
+  }
+
+  if (isProcessAlive(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+    await new Promise((res) => setTimeout(res, pollIntervalMs));
+  }
+  return !isProcessAlive(pid);
+}
+
+/**
+ * Identify the process holding a TCP listen port. Tries `lsof` first, falls
+ * back to `ss`. Returns null fields if neither tool is available or both fail.
+ */
+function findPortHolder(port: number): { pid: number | null; command: string | null } {
+  // lsof -nP -iTCP:PORT -sTCP:LISTEN -F pc (-F pc selects PID + command;
+  // dropped L (login) since we don't parse it)
+  try {
+    const out = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -F pc`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: 500,
+    });
+    let pid: number | null = null;
+    let command: string | null = null;
+    for (const line of out.split('\n')) {
+      if (line.startsWith('p')) {
+        const parsed = Number.parseInt(line.slice(1), 10);
+        if (Number.isInteger(parsed) && parsed > 0) {
+          pid = parsed;
+        }
+      } else if (line.startsWith('c')) {
+        command = line.slice(1).trim() || null;
+      }
+    }
+    if (pid !== null) {
+      return { pid, command };
+    }
+  } catch {
+    // lsof not present or no match — fall through
+  }
+
+  // ss -tlnp '( sport = :PORT )'
+  try {
+    const out = execSync(`ss -tlnp '( sport = :${port} )'`, {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      timeout: 500,
+    });
+    // ss output ex: users:(("node",pid=12345,fd=20))
+    const pidMatch = out.match(/pid=(\d+)/);
+    const cmdMatch = out.match(/users:\(\("([^"]+)"/);
+    if (pidMatch) {
+      return {
+        pid: Number.parseInt(pidMatch[1], 10),
+        command: cmdMatch ? cmdMatch[1] : null,
+      };
+    }
+  } catch {
+    // ss not present or no match
+  }
+
+  return { pid: null, command: null };
+}
+
+/**
+ * Post-bind self-test: open a TCP socket to the bridge host:port and send a
+ * HEAD-equivalent probe. Resolves the result regardless of HTTP status —
+ * any TCP-level success is treated as bind-reachable. Times out at 500ms.
+ */
+async function runBridgeSelfTest(host: string, port: number, timeoutMs = 500): Promise<BridgeSelfTest> {
+  const started = Date.now();
+  return new Promise<BridgeSelfTest>((resolve) => {
+    let settled = false;
+    const finish = (result: BridgeSelfTest) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(result);
+    };
+
+    const probeHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+    const socket = createNetConnection({ host: probeHost, port }, () => {
+      try {
+        socket.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+      } catch {
+        // swallow — just trying to elicit a response
+      }
+    });
+
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish({ pass: false, durationMs: Date.now() - started, error: `self-test timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+
+    socket.once('data', () => {
+      clearTimeout(timer);
+      socket.destroy();
+      finish({ pass: true, durationMs: Date.now() - started });
+    });
+    socket.once('error', (err) => {
+      clearTimeout(timer);
+      finish({ pass: false, durationMs: Date.now() - started, error: err.message });
+    });
+    socket.once('close', () => {
+      if (!settled) {
+        clearTimeout(timer);
+        finish({ pass: false, durationMs: Date.now() - started, error: 'socket closed before response' });
+      }
+    });
+  });
 }
 
 export interface ToolInvokeMessage {
@@ -118,6 +477,19 @@ interface BridgeStatus {
   lastPongAt?: Date;
   pendingRequests: number;
   queuedResources: number;
+  /**
+   * Result of the TCP reachability probe run immediately after the bridge
+   * binds. `null` until `start()` resolves. Surfaces WSL/Windows network
+   * anomalies that bind cleanly but route nowhere.
+   */
+  bridgeSelfTest: BridgeSelfTest | null;
+  /**
+   * Structured info about the holder when the bridge failed to bind with
+   * EADDRINUSE. `null` when start succeeded. PIDs of orphans reclaimed at
+   * startup (if any) accumulate here so `editor-status` can surface them
+   * for one-step diagnosis without `ps`.
+   */
+  startupErrorInfo: BridgeStartupErrorInfo | null;
 }
 
 export class GodotBridge extends EventEmitter {
@@ -126,25 +498,101 @@ export class GodotBridge extends EventEmitter {
   private vizWss: WebSocketServer | null = null;
   private socket: WebSocket | null = null;
   private pingInterval: NodeJS.Timeout | null = null;
+  private missedPongs = 0;
   private connectionInfo: GodotConnectionInfo | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private resourceQueues = new Map<string, Promise<void>>();
   private visualizerHtml = this.getDefaultVisualizerHtml();
+  private selfTestResult: BridgeSelfTest | null = null;
+  private startupErrorInfo: BridgeStartupErrorInfo | null = null;
+  private reclaimedPidsAtStartup: number[] = [];
+  private pidFileOwned = false;
 
   public constructor(
     private readonly port: number = DEFAULT_PORT,
     private readonly host: string = DEFAULT_HOST,
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    // Overridable so tests can drive the keepalive/pong-timeout loop fast.
+    private readonly keepaliveIntervalMs: number = KEEPALIVE_INTERVAL_MS,
   ) {
     super();
+    this.registerProcessExitHandlers();
   }
 
-  public start(): Promise<void> {
+  /**
+   * Register cleanup-on-exit handlers for the PID lockfile. Without these,
+   * a crashing gopeak would leave a stale lockfile that confuses the next
+   * instance's healthy-handoff check.
+   */
+  private registerProcessExitHandlers(): void {
+    const cleanup = () => {
+      if (this.pidFileOwned) {
+        tryUnlinkBridgePidFile(this.port, process.pid);
+        this.pidFileOwned = false;
+      }
+    };
+    process.once('exit', cleanup);
+  }
+
+  public async start(): Promise<void> {
     if (this.httpServer) {
-      return Promise.resolve();
+      return;
     }
 
-    return new Promise((resolve, reject) => {
+    // Reset per-start state.
+    this.selfTestResult = null;
+    this.startupErrorInfo = null;
+    this.reclaimedPidsAtStartup = [];
+
+    // ============================================
+    // Preflight: PID lockfile + orphan reclamation
+    // ============================================
+    // The bridge must work every session per feedback_mcp_bridge_reliability.
+    // Recurring incidents: orphan gopeaks from prior Claude Code sessions
+    // hold :6505 or have left their child Godot editors paired with a dead
+    // bridge. Three preflight steps eliminate this class of failure:
+    //   (1) If the lockfile names a healthy peer (PID + PPid both alive),
+    //       this instance exits cleanly — coexistence is incoherent.
+    //   (2) If the lockfile names a process whose parent is dead or PID 1,
+    //       reclaim it (SIGTERM → SIGKILL).
+    //   (3) Defensive sweep for orphan gopeak siblings anywhere on /proc
+    //       even if no lockfile exists (covers older builds that didn't
+    //       write one).
+    const lock = readBridgePidFile(this.port);
+    if (lock && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
+      const ppidAlive = lock.ppid > 1 && isProcessAlive(lock.ppid);
+      if (ppidAlive) {
+        const info: BridgeStartupErrorInfo = {
+          code: 'OTHER',
+          message: `Another gopeak instance is healthy (PID ${lock.pid}, parent ${lock.ppid}, started ${lock.startedAt}). This MCP server will not bind ${this.host}:${this.port}; use the existing instance.`,
+          holderPid: lock.pid,
+          holderCommand: 'gopeak',
+          reclaimedPids: [],
+        };
+        this.startupErrorInfo = info;
+        throw new BridgeStartupError(info);
+      }
+      // Orphan: parent dead, gopeak still alive holding the lockfile slot.
+      this.log('info', `Reclaiming orphan gopeak from lockfile (PID ${lock.pid}, ppid ${lock.ppid})`);
+      const reclaimed = await reclaimProcess(lock.pid, 2000);
+      if (reclaimed) {
+        this.reclaimedPidsAtStartup.push(lock.pid);
+        // Close the narrow race between process exit and the kernel
+        // releasing the socket. Node sets SO_REUSEADDR by default on Linux
+        // so this is usually a no-op, but on heavily loaded systems the
+        // socket can stay in close-wait briefly. Cheap insurance.
+        await waitForPortFree(this.host, this.port, 1500);
+      }
+      tryUnlinkBridgePidFile(this.port, lock.pid);
+    } else if (lock) {
+      // Stale lockfile (PID dead or self) — clear it.
+      tryUnlinkBridgePidFile(this.port, lock.pid);
+    }
+
+    // ============================================
+    // Bind the HTTP + WebSocket server
+    // ============================================
+    await new Promise<void>((resolve, reject) => {
       const server = http.createServer((req, res) => {
         this.handleHttpRequest(req, res);
       });
@@ -177,6 +625,21 @@ export class GodotBridge extends EventEmitter {
       server.once('error', (error) => {
         if (!settled) {
           settled = true;
+          const errCode = (error as NodeJS.ErrnoException).code;
+          if (errCode === 'EADDRINUSE') {
+            const holder = findPortHolder(this.port);
+            const killHint = holder.pid !== null ? ` Run \`kill ${holder.pid}\` to free the port.` : '';
+            const info: BridgeStartupErrorInfo = {
+              code: 'EADDRINUSE',
+              message: `EADDRINUSE on ${this.host}:${this.port}. Holder PID=${holder.pid ?? 'unknown'} (${holder.command ?? 'unknown process'}).${killHint}`,
+              holderPid: holder.pid,
+              holderCommand: holder.command,
+              reclaimedPids: [...this.reclaimedPidsAtStartup],
+            };
+            this.startupErrorInfo = info;
+            reject(new BridgeStartupError(info));
+            return;
+          }
           reject(error);
           return;
         }
@@ -193,6 +656,59 @@ export class GodotBridge extends EventEmitter {
       });
 
       server.listen(this.port, this.host);
+    });
+
+    // ============================================
+    // Post-bind: write PID lockfile + self-test
+    // ============================================
+    writeBridgePidFile(this.port, {
+      pid: process.pid,
+      ppid: typeof process.ppid === 'number' ? process.ppid : -1,
+      startedAt: new Date().toISOString(),
+      port: this.port,
+      host: this.host,
+      version: BRIDGE_VERSION,
+    });
+    this.pidFileOwned = true;
+
+    this.selfTestResult = await runBridgeSelfTest(this.host, this.port, 500);
+    if (!this.selfTestResult.pass) {
+      this.log('warn', `Post-bind self-test failed (${this.selfTestResult.durationMs}ms): ${this.selfTestResult.error ?? 'unknown error'}`);
+    } else {
+      this.log('info', `Post-bind self-test passed in ${this.selfTestResult.durationMs}ms`);
+    }
+    if (this.reclaimedPidsAtStartup.length > 0) {
+      this.log('info', `Reclaimed ${this.reclaimedPidsAtStartup.length} orphan gopeak PID(s) at startup: ${this.reclaimedPidsAtStartup.join(', ')}`);
+    }
+
+    // Defensive sibling sweep — runs in the background AFTER bind so it
+    // doesn't block startup latency. Catches stale gopeaks holding ports
+    // OTHER than our own (won't affect this instance's port — that's
+    // already taken care of by the lockfile preflight). Logs each reclaim
+    // for observability; the startup phase is already complete by the time
+    // this fires, so reclaimedPidsAtStartup is NOT mutated (that field
+    // captures only the synchronous preflight reclaims that affected the
+    // bind decision for this port).
+    this.runBackgroundOrphanSweep();
+  }
+
+  private runBackgroundOrphanSweep(): void {
+    setImmediate(async () => {
+      try {
+        const orphans = findOrphanGopeakPids();
+        if (orphans.length === 0) {
+          return;
+        }
+        await Promise.all(orphans.map(async (orphan) => {
+          this.log('info', `Background orphan sweep: reclaiming gopeak PID ${orphan.pid} (ppid ${orphan.ppid} dead/init)`);
+          const reclaimed = await reclaimProcess(orphan.pid, 2000);
+          if (!reclaimed) {
+            this.log('warn', `Background orphan sweep: PID ${orphan.pid} survived SIGTERM+SIGKILL`);
+          }
+        }));
+      } catch (err) {
+        this.log('warn', `Background orphan sweep error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
   }
 
@@ -244,6 +760,17 @@ export class GodotBridge extends EventEmitter {
 
     this.connectionInfo = null;
     this.visualizerHtml = this.getDefaultVisualizerHtml();
+
+    if (this.pidFileOwned) {
+      tryUnlinkBridgePidFile(this.port, process.pid);
+      this.pidFileOwned = false;
+    }
+    this.selfTestResult = null;
+    // Clear startupErrorInfo too so getStatus() between stop() and the next
+    // start() doesn't surface a stale EADDRINUSE from a previous attempt.
+    this.startupErrorInfo = null;
+    this.reclaimedPidsAtStartup = [];
+
     this.log('info', 'WebSocket bridge stopped');
   }
 
@@ -261,6 +788,8 @@ export class GodotBridge extends EventEmitter {
       lastPongAt: this.connectionInfo?.lastPongAt,
       pendingRequests: this.pendingRequests.size,
       queuedResources: this.resourceQueues.size,
+      bridgeSelfTest: this.selfTestResult,
+      startupErrorInfo: this.startupErrorInfo,
     };
   }
 
@@ -424,15 +953,28 @@ export class GodotBridge extends EventEmitter {
 
   private handleConnection(nextSocket: WebSocket): void {
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
-      this.log('warn', 'Rejecting second Godot connection');
-      nextSocket.close(SECOND_CONNECTION_CLOSE_CODE, 'Godot already connected');
-      return;
+      // Last-writer-wins. The editor client is a singleton, so a fresh inbound
+      // connection is authoritative — the existing socket is either being
+      // replaced after a clean editor reconnect or is a half-open zombie (the
+      // relay/editor dropped without a TCP FIN). Previously we rejected the new
+      // connection with code 4000, which locked a legitimately reconnecting
+      // editor out until the dead TCP eventually timed out (minutes). Tear the
+      // old one down and take over. handleDisconnect is passed the OLD socket,
+      // so when its late `close` fires the stale-socket guard makes it a no-op.
+      this.log('warn', 'Taking over Godot connection from a previous/stale socket (last-writer-wins)');
+      const previousSocket = this.socket;
+      this.handleDisconnect(previousSocket, new Error('Replaced by a new Godot connection'));
+      previousSocket.terminate();
     }
 
     this.socket = nextSocket;
     this.connectionInfo = {
       connectedAt: new Date(),
+      // Seed the pong clock so the first keepalive interval can't false-evict a
+      // brand-new connection before it has had a chance to reply.
+      lastPongAt: new Date(),
     };
+    this.missedPongs = 0;
 
     this.startKeepalive();
     this.log('info', 'Godot editor connected');
@@ -514,6 +1056,7 @@ export class GodotBridge extends EventEmitter {
         if (this.connectionInfo) {
           this.connectionInfo.lastPongAt = new Date();
         }
+        this.missedPongs = 0;
         return;
     }
   }
@@ -582,13 +1125,31 @@ export class GodotBridge extends EventEmitter {
         return;
       }
 
+      // Pong-timeout / half-open detection. Only advance the missed-pong
+      // counter while NO tool is in flight: a synchronous editor tool blocks
+      // Godot's main thread (and therefore its pong replies) for up to the tool
+      // timeout, so counting misses during that window would false-evict a
+      // healthy-but-busy editor. When the queue is empty, an unanswered socket
+      // is torn down after PONG_MISS_LIMIT intervals (~30s at the default),
+      // clearing the false `connected:true` and unblocking the next reconnect.
+      if (this.pendingRequests.size === 0) {
+        this.missedPongs += 1;
+        if (this.missedPongs >= PONG_MISS_LIMIT) {
+          this.log('warn', `Evicting Godot socket after ${this.missedPongs} missed pongs (half-open connection)`);
+          const deadSocket = this.socket;
+          this.handleDisconnect(deadSocket, new Error('Pong timeout — half-open Godot connection'));
+          deadSocket?.terminate();
+          return;
+        }
+      }
+
       try {
         const ping: PingMessage = { type: 'ping' };
         this.sendMessage(ping);
       } catch (error) {
         this.log('warn', `Failed to send ping: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, KEEPALIVE_INTERVAL_MS);
+    }, this.keepaliveIntervalMs);
   }
 
   private stopKeepalive(): void {
@@ -601,12 +1162,19 @@ export class GodotBridge extends EventEmitter {
   }
 
   private handleDisconnect(disconnectedSocket: WebSocket | null, reason: Error): void {
-    if (disconnectedSocket && this.socket && disconnectedSocket !== this.socket) {
+    // Ignore disconnect events that don't refer to the current socket. Covers
+    // two cases: (1) a stale socket whose `close` fires after it was already
+    // replaced by a newer connection (last-writer-wins takeover), and (2) a
+    // socket we already tore down — a forced `terminate()` emits a late `close`
+    // after we nulled `this.socket`, which would otherwise emit a second
+    // spurious `godot_disconnected`.
+    if (disconnectedSocket && disconnectedSocket !== this.socket) {
       this.log('debug', 'Ignoring stale Godot socket disconnect event');
       return;
     }
 
     this.stopKeepalive();
+    this.missedPongs = 0;
 
     this.socket = null;
     this.connectionInfo = null;
@@ -719,6 +1287,6 @@ export function getDefaultBridge(): GodotBridge {
   return defaultBridge;
 }
 
-export function createBridge(port?: number, timeoutMs?: number, host?: string): GodotBridge {
-  return new GodotBridge(port, host, timeoutMs);
+export function createBridge(port?: number, timeoutMs?: number, host?: string, keepaliveIntervalMs?: number): GodotBridge {
+  return new GodotBridge(port, host, timeoutMs, keepaliveIntervalMs);
 }

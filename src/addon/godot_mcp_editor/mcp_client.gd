@@ -6,17 +6,22 @@ signal connected
 signal disconnected
 signal tool_requested(request_id: String, tool_name: String, args: Dictionary)
 
-const DEFAULT_URL := "ws://localhost:6505/godot"
-const DEFAULT_HOST := "localhost"
+const DEFAULT_URL := "ws://127.0.0.1:6505/godot"
+const DEFAULT_HOST := "127.0.0.1"
 const DEFAULT_PORT := 6505
 const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
 const RECONNECT_DELAY := 3.0
 const MAX_RECONNECT_DELAY := 30.0
+const LOG_PATH := "user://mcp_editor_client.log"
 
 var socket: WebSocketPeer = WebSocketPeer.new()
 var server_url: String = DEFAULT_URL
 var _is_connected := false
+# True between a successful `connect_to_url` and either STATE_OPEN (success) or
+# STATE_CLOSED (the attempt failed before opening). Lets `_process` tell a failed
+# *attempt* apart from an idle socket so it can re-arm the reconnect backoff.
+var _connecting := false
 var _reconnect_timer: Timer
 var _current_reconnect_delay := RECONNECT_DELAY
 var _should_reconnect := true
@@ -34,6 +39,38 @@ func _ready() -> void:
 
 	set_process(true)
 	_initialized = true
+	_log("INFO", "ready", "project_path=%s" % _project_path)
+
+
+# File logging — writes a single line per state change to
+# `user://mcp_editor_client.log`. Under WSL, `user://` resolves to
+# `%APPDATA%\Godot\app_userdata\<project>\` which is tailable from
+# the Linux side via `/mnt/c/Users/.../app_userdata/.../`.
+# Godot editor does not produce its own log file (only child project
+# runs do) so this is the only reliable way to observe plugin state
+# when the editor is running on Windows and Claude Code on WSL.
+#
+# File writes are gated behind the `GOPEAK_PLUGIN_LOG=1` env var so
+# normal-dev users don't get a mystery log file. `print()` always
+# fires so the Editor Output panel still shows state.
+static func _log(level: String, kind: String, detail: String = "") -> void:
+	var line := "[%s] level=%s source=mcp_client kind=%s %s" % [
+		Time.get_datetime_string_from_system(true),
+		level,
+		kind,
+		detail,
+	]
+	print(line)
+	if OS.get_environment("GOPEAK_PLUGIN_LOG") != "1":
+		return
+	var f := FileAccess.open(LOG_PATH, FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open(LOG_PATH, FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line(line)
+	f.close()
 
 
 func _process(_delta: float) -> void:
@@ -41,8 +78,7 @@ func _process(_delta: float) -> void:
 		return
 
 	if socket.get_ready_state() == WebSocketPeer.STATE_CLOSED:
-		if _is_connected:
-			_handle_disconnect()
+		_handle_closed_state()
 		return
 
 	socket.poll()
@@ -60,8 +96,26 @@ func _process(_delta: float) -> void:
 			pass
 
 		WebSocketPeer.STATE_CLOSED:
-			if _is_connected:
-				_handle_disconnect()
+			_handle_closed_state()
+
+
+# Centralised STATE_CLOSED handling. A socket reaches CLOSED either because an
+# established connection dropped (`_is_connected`) or because a connection
+# *attempt* failed before STATE_OPEN was ever reached (`_connecting`). The latter
+# was previously a dead-end: `connect_to_url` returns OK, the socket goes
+# CONNECTING -> CLOSED on a refused/dropped handshake (e.g. during a bridge
+# ownership gap), and nothing rescheduled a reconnect — so the client went
+# permanently silent until the editor was restarted. Both paths now re-arm the
+# backoff timer; the `is_stopped()` guard preserves an already-running backoff
+# and prevents rescheduling every frame.
+func _handle_closed_state() -> void:
+	if _is_connected:
+		_handle_disconnect()
+	elif _connecting and _should_reconnect:
+		_connecting = false
+		_log("WARN", "connect_failed", "url=%s socket closed before open" % server_url)
+		if _reconnect_timer.is_stopped():
+			_schedule_reconnect()
 
 
 func connect_to_server(url: String = "") -> void:
@@ -113,6 +167,7 @@ func _resolve_server_url(explicit_url: String) -> String:
 
 func disconnect_from_server() -> void:
 	_should_reconnect = false
+	_connecting = false
 	if _reconnect_timer:
 		_reconnect_timer.stop()
 	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
@@ -121,16 +176,22 @@ func disconnect_from_server() -> void:
 
 
 func _attempt_connection() -> void:
+	_log("INFO", "attempt", "url=%s" % server_url)
 	if socket.get_ready_state() != WebSocketPeer.STATE_CLOSED:
 		socket.close()
 
 	var err := socket.connect_to_url(server_url)
 	if err != OK:
+		_connecting = false
+		_log("ERROR", "connect_to_url_failed", "url=%s err=%d" % [server_url, err])
 		push_error("[MCP Editor] Failed to connect: %s" % err)
 		_schedule_reconnect()
+	else:
+		_connecting = true
 
 
 func _handle_connect() -> void:
+	_connecting = false
 	_is_connected = true
 	_current_reconnect_delay = RECONNECT_DELAY
 
@@ -139,11 +200,15 @@ func _handle_connect() -> void:
 		"project_path": _project_path
 	})
 
+	_log("INFO", "connect", "url=%s" % server_url)
 	connected.emit()
 
 
 func _handle_disconnect() -> void:
 	_is_connected = false
+	var close_code := socket.get_close_code()
+	var close_reason := socket.get_close_reason()
+	_log("INFO", "disconnect", "code=%d reason=%s" % [close_code, close_reason])
 	disconnected.emit()
 
 	if _should_reconnect:
@@ -152,12 +217,15 @@ func _handle_disconnect() -> void:
 
 func _schedule_reconnect() -> void:
 	if _reconnect_timer == null:
+		_log("ERROR", "reconnect_timer_null", "cannot schedule reconnect")
 		return
+	_log("INFO", "backoff", "delay=%.1f next=%.1f" % [_current_reconnect_delay, min(_current_reconnect_delay * 2.0, MAX_RECONNECT_DELAY)])
 	_reconnect_timer.start(_current_reconnect_delay)
 	_current_reconnect_delay = min(_current_reconnect_delay * 2.0, MAX_RECONNECT_DELAY)
 
 
 func _on_reconnect_timer() -> void:
+	_log("INFO", "reconnect_timer_fired", "")
 	_attempt_connection()
 
 

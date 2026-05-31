@@ -196,6 +196,73 @@ export function resolveDefaultRuntimeHost(): string {
 }
 
 /**
+ * Resolve the TCP port the MCP server should use when connecting to the
+ * Godot DAP server. Engine binds `127.0.0.1:6006` hardcoded; the editor
+ * addon's `McpDapRelay` exposes it on `0.0.0.0:<relay_port>` (default
+ * 6016) so WSL clients can reach it without a `netsh portproxy` rule.
+ *
+ * Resolution order:
+ *   1. `GOPEAK_DAP_PORT` / `GODOT_DAP_PORT` / `MCP_DAP_PORT` env override
+ *   2. `6006` default (upstream engine port; used when the relay is
+ *      disabled or running on the same host).
+ *
+ * Returning a relay port here assumes the user has flipped
+ * `mcp/editor/dap_relay_enabled` in Project Settings and restarted the
+ * Godot editor. This helper does not read `project.godot` itself —
+ * keeping it pure so it unit-tests with the rest of `wsl_interop.ts`.
+ */
+export function resolveDefaultDAPPort(): number {
+  const envValue =
+    process.env.GOPEAK_DAP_PORT ||
+    process.env.GODOT_DAP_PORT ||
+    process.env.MCP_DAP_PORT;
+  if (envValue) {
+    const parsed = Number.parseInt(envValue, 10);
+    if (Number.isFinite(parsed) && parsed > 0 && parsed < 65536) {
+      return parsed;
+    }
+  }
+  return 6006;
+}
+
+const RUNTIME_PORT_ENV_KEYS = ['GOPEAK_RUNTIME_PORT', 'GODOT_RUNTIME_PORT', 'MCP_RUNTIME_PORT'] as const;
+const RUNTIME_PORT_DEFAULT = 7777;
+
+/**
+ * Resolve the TCP port the MCP server should use when connecting to the
+ * Godot runtime autoload (`addons/godot_mcp_runtime/`). Mirrors the
+ * bridge/DAP env-override pattern so port 7777 is escapable when something
+ * else holds the port on the Windows side.
+ *
+ * Resolution order:
+ *   1. `GOPEAK_RUNTIME_PORT` / `GODOT_RUNTIME_PORT` / `MCP_RUNTIME_PORT`
+ *      env override (first valid wins).
+ *   2. `7777` default (hardcoded constant on the autoload side; agreement
+ *      enforced by `testRuntimePortAddonEnvOverride` in
+ *      `test-regressions.mjs`).
+ *
+ * Invalid values (non-integer, ≤0, ≥65536) emit a warning to stderr and
+ * fall through to the next key, matching `resolveDefaultBridgePort()`.
+ */
+export function resolveDefaultRuntimePort(): number {
+  for (const key of RUNTIME_PORT_ENV_KEYS) {
+    const raw = process.env[key];
+    if (!raw || raw.trim().length === 0) {
+      continue;
+    }
+
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+      return parsed;
+    }
+
+    console.error(`[wsl_interop] Ignoring invalid ${key}="${raw}". Expected an integer between 1 and 65535.`);
+  }
+
+  return RUNTIME_PORT_DEFAULT;
+}
+
+/**
  * Normalize a path for cross-platform equality comparison. Handles the
  * WSL↔Windows case where Godot LSP responses arrive as `file:///C:/...` but
  * local filesystem resolution produces `/mnt/c/...`.

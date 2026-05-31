@@ -3,17 +3,24 @@ extends EditorPlugin
 
 const MCPEditorClientScript = preload("mcp_client.gd")
 const MCPToolExecutorScript = preload("tool_executor.gd")
+const McpDapRelayScript = preload("dap_relay.gd")
 
 const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
+const SETTING_DAP_RELAY_ENABLED := "mcp/editor/dap_relay_enabled"
+const SETTING_DAP_RELAY_PORT := "mcp/editor/dap_relay_port"
+const DAP_RELAY_DEFAULT_PORT := 6016
 
 var _mcp_client: Node
 var _tool_executor: Node
+var _dap_relay: Node
 var _status_label: Label
 
 
 func _enter_tree() -> void:
+	_plugin_log("enter_tree_start")
 	_register_project_settings()
+	_plugin_log("project_settings_registered")
 
 	_mcp_client = MCPEditorClientScript.new()
 	_mcp_client.name = "MCPEditorClient"
@@ -24,12 +31,34 @@ func _enter_tree() -> void:
 	add_child(_tool_executor)
 	_tool_executor.set_editor_plugin(self)
 
+	_spawn_dap_relay_if_enabled()
+
 	_mcp_client.connected.connect(_on_connected)
 	_mcp_client.disconnected.connect(_on_disconnected)
 	_mcp_client.tool_requested.connect(_on_tool_requested)
 
 	_setup_status_indicator()
+	_plugin_log("about_to_connect")
 	_mcp_client.connect_to_server()
+	_plugin_log("enter_tree_end")
+
+
+func _plugin_log(kind: String) -> void:
+	var line := "[%s] level=INFO source=plugin kind=%s" % [
+		Time.get_datetime_string_from_system(true),
+		kind,
+	]
+	print(line)
+	if OS.get_environment("GOPEAK_PLUGIN_LOG") != "1":
+		return
+	var f := FileAccess.open("user://mcp_editor_client.log", FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open("user://mcp_editor_client.log", FileAccess.WRITE)
+	if f == null:
+		return
+	f.seek_end()
+	f.store_line(line)
+	f.close()
 
 
 func _exit_tree() -> void:
@@ -47,6 +76,10 @@ func _exit_tree() -> void:
 	if _tool_executor:
 		_tool_executor.queue_free()
 		_tool_executor = null
+
+	if _dap_relay:
+		_dap_relay.queue_free()
+		_dap_relay = null
 
 	if _status_label:
 		remove_control_from_container(CONTAINER_TOOLBAR, _status_label)
@@ -78,14 +111,21 @@ func _register_project_settings() -> void:
 	# Surface bridge host/port in Project Settings UI with sensible defaults.
 	# Designers can override per-project (e.g. point at the WSL host IP when
 	# Godot runs on Windows and the bridge binds on a WSL interface).
+	# Default to the IPv4 literal so Windows resolvers don't try the AAAA
+	# record first and eat a ~30s timeout when the bridge node listens only
+	# on IPv4 (fork binds 0.0.0.0:6505 = IPv4). Set the value via
+	# set_setting without the has_setting guard so existing projects pick
+	# up the fixed default on fork update. Users who intentionally set a
+	# different host via Project Settings UI write their own value and it
+	# persists in project.godot, overriding this default.
 	if not ProjectSettings.has_setting(SETTING_BRIDGE_HOST):
-		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "localhost")
-	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "localhost")
+		ProjectSettings.set_setting(SETTING_BRIDGE_HOST, "127.0.0.1")
+	ProjectSettings.set_initial_value(SETTING_BRIDGE_HOST, "127.0.0.1")
 	ProjectSettings.add_property_info({
 		"name": SETTING_BRIDGE_HOST,
 		"type": TYPE_STRING,
 		"hint": PROPERTY_HINT_NONE,
-		"hint_string": "Host the MCP editor bridge should connect to (default: localhost).",
+		"hint_string": "Host the MCP editor bridge should connect to (default: 127.0.0.1 — IPv4 literal avoids ~30s WSL autoforward AAAA fallback).",
 	})
 
 	if not ProjectSettings.has_setting(SETTING_BRIDGE_PORT):
@@ -97,6 +137,39 @@ func _register_project_settings() -> void:
 		"hint": PROPERTY_HINT_RANGE,
 		"hint_string": "1,65535,1",
 	})
+
+	# DAP relay — bridges the engine's hardcoded `127.0.0.1:6006` to
+	# `0.0.0.0:<dap_relay_port>` so WSL clients can reach it without
+	# a `netsh portproxy` rule. Opt-in per project.
+	if not ProjectSettings.has_setting(SETTING_DAP_RELAY_ENABLED):
+		ProjectSettings.set_setting(SETTING_DAP_RELAY_ENABLED, false)
+	ProjectSettings.set_initial_value(SETTING_DAP_RELAY_ENABLED, false)
+	ProjectSettings.add_property_info({
+		"name": SETTING_DAP_RELAY_ENABLED,
+		"type": TYPE_BOOL,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "Expose the Godot DAP server on 0.0.0.0:<dap_relay_port> via an in-editor TCP relay (WSL→Windows Godot workaround).",
+	})
+
+	if not ProjectSettings.has_setting(SETTING_DAP_RELAY_PORT):
+		ProjectSettings.set_setting(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT)
+	ProjectSettings.set_initial_value(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT)
+	ProjectSettings.add_property_info({
+		"name": SETTING_DAP_RELAY_PORT,
+		"type": TYPE_INT,
+		"hint": PROPERTY_HINT_RANGE,
+		"hint_string": "1024,65535,1",
+	})
+
+
+func _spawn_dap_relay_if_enabled() -> void:
+	var enabled: bool = ProjectSettings.get_setting(SETTING_DAP_RELAY_ENABLED, false)
+	if not enabled:
+		return
+	var port: int = int(ProjectSettings.get_setting(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT))
+	_dap_relay = McpDapRelayScript.new(port)
+	_dap_relay.name = "MCPDapRelay"
+	add_child(_dap_relay)
 
 
 func _on_tool_requested(request_id: String, tool_name: String, args: Dictionary) -> void:

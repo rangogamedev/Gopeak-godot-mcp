@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, writeSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir, release } from 'os';
 import { spawn, exec, execFile } from 'child_process';
 import { createConnection as createTcpConnection } from 'node:net';
@@ -38,16 +38,20 @@ import {
   resolveWSLWindowsTempDir,
   resolveWindowsHostIp,
   resolveDefaultRuntimeHost,
+  resolveDefaultRuntimePort,
 } from './wsl_interop.js';
 import { mapProject } from './gdscript_parser.js';
 import { serveVisualization, setProjectPath, stopVisualizationServer } from './visualizer-server.js';
-import { GodotBridge, getDefaultBridge } from './godot-bridge.js';
+import { GodotBridge, getDefaultBridge, BridgeStartupError } from './godot-bridge.js';
+import type { BridgeStartupErrorInfo } from './godot-bridge.js';
 import { getPrompt, listPrompts } from './prompts.js';
 import { buildToolDefinitions as buildToolDefinitionsForServer } from './tool-definitions.js';
 import { CORE_TOOL_GROUPS, TOOL_GROUPS } from './tool-groups.js';
+import { parseStartupActiveGroups } from './startup-active-groups.js';
 import { DEBUG_MODE, GODOT_DEBUG_MODE_DEFAULT, SERVER_VERSION } from './server-version.js';
 import type {
   GodotProcess,
+  GodotEditorProcess,
   GodotServerConfig,
   MCPToolDefinition,
   OperationParams,
@@ -68,6 +72,7 @@ const __dirname = dirname(__filename);
 class GodotServer {
   private server: Server;
   private activeProcess: GodotProcess | null = null;
+  private editorProcess: GodotEditorProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
@@ -76,6 +81,8 @@ class GodotServer {
   private lspClient: GodotLSPClient | null = null;
   private dapClient: GodotDAPClient | null = null;
   private bridgeStartupError: string | null = null;
+  private bridgeStartupErrorInfo: BridgeStartupErrorInfo | null = null;
+  private godotReadyPromise: Promise<void> | null = null;
   private lastProjectPath: string | null = null;
   private recordingMode: 'lite' | 'full' = (process.env.LOG_MODE === 'full' ? 'full' : 'lite');
   private logQueue: Array<{ filePath: string; payload: Record<string, unknown> }> = [];
@@ -86,7 +93,8 @@ class GodotServer {
   private cachedToolDefinitions: MCPToolDefinition[] = [];
   private toolDefinitionFactory: (() => MCPToolDefinition[]) | null = null;
   private readonly toolExposureProfile: 'compact' | 'full' | 'legacy';
-  private readonly toolsListPageSize: number;
+  private toolsListPageSize: number;
+  private toolsListPageSizeExplicit: boolean = false;
   private activeGroups: Set<string> = new Set();
   private readonly compactAliasToLegacy: Record<string, string> = {
     'tool.catalog': 'tool_catalog',
@@ -98,6 +106,9 @@ class GodotServer {
     'editor.launch': 'launch_editor',
     'editor.run': 'run_project',
     'editor.stop': 'stop_project',
+    'editor.close': 'close_editor',
+    'editor.restart': 'restart_editor',
+    'editor.fs_scanning': 'get_fs_scanning_status',
     'editor.debug_output': 'get_debug_output',
     'editor.status': 'get_editor_status',
     'editor.version': 'get_godot_version',
@@ -181,10 +192,21 @@ class GodotServer {
       this.toolExposureProfile = 'compact';
     }
 
-    const rawToolsPageSize = parseInt(process.env.GOPEAK_TOOLS_PAGE_SIZE || '33', 10);
+    const explicitToolsPageSize = process.env.GOPEAK_TOOLS_PAGE_SIZE;
+    const rawToolsPageSize = parseInt(explicitToolsPageSize || '33', 10);
     this.toolsListPageSize = Number.isFinite(rawToolsPageSize) && rawToolsPageSize > 0
       ? rawToolsPageSize
       : 33;
+    this.toolsListPageSizeExplicit = explicitToolsPageSize !== undefined && explicitToolsPageSize !== '';
+
+    // Pre-activate dynamic tool groups listed in GOPEAK_STARTUP_ACTIVE_GROUPS
+    // (or MCP_STARTUP_ACTIVE_GROUPS). Comma-separated group names matched
+    // case-insensitively against Object.keys(TOOL_GROUPS). Lets clients whose
+    // tool cache does not refresh on notifications/tools/list_changed (e.g.
+    // Claude Code) still see commonly-needed dynamic tools in the initial
+    // tools/list response without switching off the compact profile.
+    // No-op unless profile=compact.
+    this.applyStartupActiveGroups();
 
     // Initialize reverse parameter mappings
     for (const [snakeCase, camelCase] of Object.entries(this.parameterMappings)) {
@@ -531,6 +553,43 @@ class GodotServer {
     return false;
   }
 
+  /**
+   * Run Godot-path detection + validation off the startup critical path.
+   * Called after the stdio transport is attached so MCP handshake does
+   * not block on the slow Windows-exe `--version` spawn from WSL.
+   * Tool handlers either await `this.godotReadyPromise` explicitly or
+   * fall through to the lazy-detect guards already in `executeOperation`
+   * / `getGodotVersionText`.
+   */
+  private async detectAndValidateGodotPath(): Promise<void> {
+    await this.detectGodotPath();
+
+    if (!this.godotPath) {
+      console.error('[SERVER] Failed to find a valid Godot executable path');
+      console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
+      if (this.strictPathValidation) {
+        process.exit(1);
+      }
+      return;
+    }
+
+    const isValid = await this.isValidGodotPath(this.godotPath);
+
+    if (!isValid) {
+      if (this.strictPathValidation) {
+        console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
+        console.error('[SERVER] Please set a valid GODOT_PATH environment variable or provide a valid path');
+        process.exit(1);
+      }
+      console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
+      console.error('[SERVER] This may cause issues when executing Godot commands');
+      console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
+      return;
+    }
+
+    console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
+  }
+
   private getWSLInteropDetails(godotPath: string | null = this.godotPath): WSLInteropDetails {
     return wslGetInteropDetails(godotPath);
   }
@@ -630,6 +689,52 @@ class GodotServer {
     process.once('SIGHUP', () => requestShutdown('SIGHUP', 0));
     process.once('beforeExit', (code: number) => requestShutdown(`beforeExit:${code}`));
     process.once('exit', () => this.forceCleanupOnExit());
+
+    // Standard MCP-stdio shutdown: the parent (Claude Code, MCP Inspector,
+    // etc.) signals teardown by closing stdin. Without this handler, gopeak
+    // would survive its parent and orphan onto PID 1 — the root cause of the
+    // bridge-reliability incidents documented in wiki/topics/mcp_fork_notes.md
+    // and feedback memory feedback_mcp_bridge_reliability. Three independent
+    // mechanisms cover the failure mode because each can be inhibited by
+    // specific SDK/transport behaviors:
+    //   (1) `process.stdin.on('end'|'close')` — fires when the parent closes
+    //       its writable side of the pipe. Most reliable when the SDK
+    //       transport keeps stdin in flowing mode.
+    //   (2) `transport.onclose` — wired in run() once the transport exists.
+    //       Fires only when transport.close() is called explicitly by the
+    //       SDK; not a substitute for (1) but useful when present.
+    //   (3) Parent-process watchdog — polls `process.ppid` every 2s. When
+    //       PPid flips to 1 (orphaned to init), the parent is gone; exit.
+    //       This is the belt-and-suspenders safety net.
+    const onStdinClose = (source: string) => {
+      if (!this.shutdownInitiated) {
+        console.error(`[SERVER] Parent stdio closed (${source}) — shutting down gracefully`);
+      }
+      requestShutdown(source, 0);
+    };
+    process.stdin.on('end', () => onStdinClose('stdin:end'));
+    process.stdin.on('close', () => onStdinClose('stdin:close'));
+
+    // Mechanism (3): parent-watchdog. If PPid changes to 1, the parent
+    // died and the process was reparented to init — exit. Only orphan-to-init
+    // is checked; a generic ppid change (e.g. systemd user-session restart,
+    // tmux re-attach) would spuriously shut down a healthy gopeak.
+    // Negligible cost: one syscall every 2 seconds.
+    const initialPpid = typeof process.ppid === 'number' ? process.ppid : -1;
+    if (initialPpid > 1) {
+      const watchdog = setInterval(() => {
+        const ppidNow = typeof process.ppid === 'number' ? process.ppid : -1;
+        if (ppidNow === 1) {
+          if (!this.shutdownInitiated) {
+            console.error(`[SERVER] Parent process died (ppid ${initialPpid} → 1, orphaned to init) — shutting down gracefully`);
+          }
+          clearInterval(watchdog);
+          requestShutdown('parent-watchdog', 0);
+        }
+      }, 2000);
+      // Don't keep the event loop alive solely for this poll.
+      watchdog.unref?.();
+    }
   }
 
   private async handleShutdown(source: string, exitCode?: number): Promise<void> {
@@ -674,7 +779,7 @@ class GodotServer {
     args: unknown,
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
-    const RUNTIME_PORT = 7777;
+    const RUNTIME_PORT = resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const TIMEOUT_MS = 10000;
 
@@ -942,6 +1047,85 @@ class GodotServer {
   private notifyToolListChanged(): void {
     this.cachedToolDefinitions = [];
     this.server.sendToolListChanged().catch(() => {});
+  }
+
+  /**
+   * Seed `this.activeGroups` from `GOPEAK_STARTUP_ACTIVE_GROUPS` (or fallback
+   * `MCP_STARTUP_ACTIVE_GROUPS`). Called from the constructor before
+   * `this.server` is instantiated, so the first `tools/list` response on MCP
+   * handshake already includes these groups' tools. This is the workaround
+   * for clients whose tool cache does not refresh on
+   * `notifications/tools/list_changed` (e.g. Claude Code).
+   *
+   * Contract:
+   *  - Unset or empty env: no-op.
+   *  - `toolExposureProfile !== 'compact'`: no-op + one-line stderr warning
+   *    (full/legacy already expose all tools, so pre-activation is redundant).
+   *  - Unknown group names: per-batch stderr warning; valid names still applied.
+   *  - Case-insensitive match against `Object.keys(TOOL_GROUPS)`.
+   *  - Whitespace around commas tolerated; empty items dropped.
+   *
+   * Parse logic lives in `./startup-active-groups.ts` as a pure function so
+   * it is unit-testable without spawning the MCP server.
+   */
+  private applyStartupActiveGroups(): void {
+    const raw = process.env.GOPEAK_STARTUP_ACTIVE_GROUPS ?? process.env.MCP_STARTUP_ACTIVE_GROUPS ?? '';
+    if (raw.trim() === '') {
+      return;
+    }
+
+    if (this.toolExposureProfile !== 'compact') {
+      console.error(
+        `[SERVER] GOPEAK_STARTUP_ACTIVE_GROUPS ignored under profile=${this.toolExposureProfile} ` +
+        `(only the compact profile benefits from pre-activation; full/legacy already expose all tools).`,
+      );
+      return;
+    }
+
+    const knownGroups = Object.keys(TOOL_GROUPS);
+    const { activated, unknown } = parseStartupActiveGroups(raw, knownGroups);
+
+    for (const name of activated) {
+      this.activeGroups.add(name);
+    }
+
+    if (unknown.length > 0) {
+      console.error(
+        `[SERVER] GOPEAK_STARTUP_ACTIVE_GROUPS: ignoring unknown group(s): ${unknown.join(', ')}. ` +
+        `Known dynamic groups: ${knownGroups.join(', ')}.`,
+      );
+    }
+
+    if (activated.length > 0) {
+      console.error(
+        `[SERVER] Pre-activating ${activated.length} tool group(s) from startup env: ${activated.join(', ')}.`,
+      );
+    }
+
+    // Auto-raise the tools/list page size if pre-activation pushes the
+    // exposed tool count past the configured page. MCP `tools/list` chunks
+    // at `toolsListPageSize` with `nextCursor` for subsequent pages;
+    // clients that do not follow `nextCursor` for deferred-tool discovery
+    // (Claude Code) only see page 1, so pre-activated dynamic tools would
+    // be stranded on page 2+. Only auto-raise when the user has not set
+    // `GOPEAK_TOOLS_PAGE_SIZE` explicitly.
+    if (!this.toolsListPageSizeExplicit && this.toolExposureProfile === 'compact' && activated.length > 0) {
+      let activatedToolCount = 0;
+      for (const groupName of activated) {
+        const group = TOOL_GROUPS[groupName];
+        if (group) {
+          activatedToolCount += group.tools.length;
+        }
+      }
+      const compactAliasCount = Object.keys(this.compactAliasToLegacy).length;
+      const needed = compactAliasCount + activatedToolCount;
+      if (needed > this.toolsListPageSize) {
+        console.error(
+          `[SERVER] Raising tools/list page size ${this.toolsListPageSize} → ${needed} so all pre-activated tools fit in the first page (clients that do not follow nextCursor would otherwise miss ${needed - this.toolsListPageSize} tool(s)). Set GOPEAK_TOOLS_PAGE_SIZE explicitly to override.`,
+        );
+        this.toolsListPageSize = needed;
+      }
+    }
   }
 
   private autoActivateMatchingGroups(query: string): string[] {
@@ -1404,18 +1588,53 @@ class GodotServer {
 
   private getEditorStatusPayload() {
     const status = this.godotBridge.getStatus();
-    const isPortConflict = this.bridgeStartupError?.includes('EADDRINUSE') ?? false;
+    const isPortConflict = this.bridgeStartupErrorInfo?.code === 'EADDRINUSE'
+      || (this.bridgeStartupError?.includes('EADDRINUSE') ?? false);
+
+    const launchedByMcp = this.editorProcess !== null;
+    const editorPid = this.editorProcess?.process?.pid ?? null;
+    const launchedAt = this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null;
+    const tracked_project_path = this.editorProcess?.projectPath ?? null;
+
+    const conflictNote = (() => {
+      if (!isPortConflict) {
+        return undefined;
+      }
+      const info = this.bridgeStartupErrorInfo;
+      if (info?.holderPid !== null && info?.holderPid !== undefined) {
+        return `Bridge port is already in use by ${info.holderCommand ?? 'unknown'} (PID ${info.holderPid}). Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.`;
+      }
+      return 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.';
+    })();
+
+    const conflictSuggestion = (() => {
+      if (!isPortConflict) {
+        return undefined;
+      }
+      const info = this.bridgeStartupErrorInfo;
+      if (info?.holderPid !== null && info?.holderPid !== undefined) {
+        return `Run \`kill ${info.holderPid}\` to free the port, then restart Claude Code.`;
+      }
+      return 'Stop duplicate gopeak/MCP server instances or re-run the command from the same server process that owns the bridge port.';
+    })();
 
     return {
       ...status,
+      // Backward-compatible surface: `bridgeAvailable` boolean + `startupError`
+      // string (matches /EADDRINUSE/i in legacy regression test).
       bridgeAvailable: this.bridgeStartupError === null,
       startupError: this.bridgeStartupError,
-      note: isPortConflict
-        ? 'Bridge port is already in use. Another gopeak instance may own the editor bridge, so this server cannot report that editor connection.'
-        : undefined,
-      suggestion: isPortConflict
-        ? 'Stop duplicate gopeak/MCP server instances or re-run the command from the same server process that owns the bridge port.'
-        : undefined,
+      // Structured holder info from BridgeStartupErrorInfo (new fields).
+      startupErrorInfo: this.bridgeStartupErrorInfo,
+      holderPid: this.bridgeStartupErrorInfo?.holderPid ?? null,
+      holderCommand: this.bridgeStartupErrorInfo?.holderCommand ?? null,
+      reclaimedPidsAtStartup: this.bridgeStartupErrorInfo?.reclaimedPids ?? [],
+      launched_by_mcp: launchedByMcp,
+      editor_pid: editorPid,
+      launched_at: launchedAt,
+      tracked_project_path,
+      note: conflictNote,
+      suggestion: conflictSuggestion,
     };
   }
 
@@ -1581,6 +1800,12 @@ class GodotServer {
           return await this.handleGetDebugOutput();
         case 'stop_project':
           return await this.handleStopProject();
+        case 'close_editor':
+          return await this.handleCloseEditor(request.params.arguments);
+        case 'restart_editor':
+          return await this.handleRestartEditor(request.params.arguments);
+        case 'get_fs_scanning_status':
+          return await this.handleViaBridge('get_fs_scanning_status', request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -1870,14 +2095,28 @@ class GodotServer {
 
       const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
       this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
-      const process = spawn(prepared.command, prepared.args, {
+      const editorChild = spawn(prepared.command, prepared.args, {
         stdio: 'pipe',
         cwd: prepared.cwd,
       });
 
-      process.on('error', (err: Error) => {
+      editorChild.on('error', (err: Error) => {
         console.error('Failed to start Godot editor:', err);
+        if (this.editorProcess && this.editorProcess.process === editorChild) {
+          this.editorProcess = null;
+        }
       });
+      editorChild.on('exit', () => {
+        if (this.editorProcess && this.editorProcess.process === editorChild) {
+          this.editorProcess = null;
+        }
+      });
+
+      this.editorProcess = {
+        process: editorChild,
+        projectPath: prepared.targetProjectPath,
+        launchedAt: Date.now(),
+      };
 
       return {
         content: [
@@ -2124,6 +2363,249 @@ class GodotServer {
           ),
         },
       ],
+    };
+  }
+
+  /**
+   * Handle the close_editor tool
+   *
+   * Safety contract (in order):
+   *  - C4: if a game-debug session is active (this.activeProcess), stop it
+   *    first via handleStopProject so its tracking is clean.
+   *  - HITL gate: if the editor was NOT launched by this MCP server
+   *    (this.editorProcess === null) and bridge IS connected (i.e., a user-
+   *    owned editor), refuse by default. Caller must opt-in via force=true
+   *    paired with i_understand_data_loss_risk=true, OR via prefer_pid_kill.
+   *    Prevents AI agents from closing the user's working editor.
+   *  - Force-on-user-editor gate: force=true alone is not enough on a user-
+   *    owned editor; also requires i_understand_data_loss_risk=true.
+   *
+   * Two paths after gates pass:
+   *  - Path A (preferred): bridge IPC dispatch. Addon enforces safety guards
+   *    (fs_scanning, modal_open, save_blocked / writability pre-check) and
+   *    calls get_tree().quit() via call_deferred so the response flushes
+   *    before termination. Respects `force`, `save_first` flags.
+   *  - Path B (fallback): direct process.kill() when bridge is disconnected
+   *    but `editorProcess` is tracked. SIGTERM by default, SIGKILL if
+   *    `force_kill=true`. Bypasses GDScript guards (editor is unresponsive).
+   *
+   * editorProcess null transition is owned by spawn's on('exit') listener —
+   * we never null it here on Path A success because the editor hasn't actually
+   * quit at response time (quit is deferred). C2 fix.
+   */
+  private async handleCloseEditor(args: any): Promise<any> {
+    const opts = (args || {}) as {
+      force?: boolean;
+      save_first?: boolean;
+      force_kill?: boolean;
+      prefer_pid_kill?: boolean;
+      i_understand_data_loss_risk?: boolean;
+    };
+
+    // C4: stop active game-debug FIRST so activeProcess tracking is clean.
+    if (this.activeProcess !== null) {
+      this.logDebug('close_editor: stopping active game-debug session first (C4)');
+      try {
+        await this.handleStopProject();
+      } catch {
+        // handleStopProject swallows its own errors and returns a response; on
+        // throw we still want to proceed to the editor close.
+      }
+    }
+
+    const bridgeConnected = this.godotBridge.isConnected();
+    const hasTrackedPid = this.editorProcess !== null;
+
+    // HITL gates apply only when bridge is connected (i.e., there's actually
+    // an editor to close) and we don't own the editor.
+    if (bridgeConnected && !hasTrackedPid) {
+      const userAcked = opts.i_understand_data_loss_risk === true;
+      const willPidKill = opts.prefer_pid_kill === true;
+      if (!opts.force && !willPidKill) {
+        console.error('[close_editor] HITL refusal: user-owned editor; no force/prefer_pid_kill flag');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              reason: 'user_editor_not_owned_by_mcp',
+              remediation: 'this editor was opened by the user (launched_by_mcp=false). To close it anyway, retry with force=true AND i_understand_data_loss_risk=true. The auto-save guard still runs unless you also pass force=true without save_first.',
+              hint: 'check editor-status.launched_by_mcp to confirm ownership',
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+      if (opts.force === true && !userAcked) {
+        console.error('[close_editor] HITL refusal: force=true on user-owned editor requires explicit data-loss acknowledgement');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              reason: 'force_requires_acknowledgement',
+              remediation: 'force=true on a user-owned editor needs i_understand_data_loss_risk=true paired with it. This is a double-explicit gate to prevent accidental data loss from a misconfigured caller.',
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+    }
+
+    const usePidKill = (!bridgeConnected && hasTrackedPid) || (opts.prefer_pid_kill === true && hasTrackedPid);
+
+    if (usePidKill) {
+      // Path B: PID-kill fallback. Guards bypassed (no GDScript-side check).
+      const tracked = this.editorProcess!;
+      if (!tracked.process || typeof tracked.process.kill !== 'function') {
+        return this.createErrorResponse(
+          'Tracked editor process handle is invalid; cannot signal.',
+          ['Process may have already exited', 'Check editor-status for current state'],
+        );
+      }
+      const signal: NodeJS.Signals = opts.force_kill ? 'SIGKILL' : 'SIGTERM';
+      const bridgeWasAvailable = bridgeConnected;
+      console.error(`[close_editor] path=pid_kill signal=${signal} bridge_was_available=${bridgeWasAvailable} prefer_pid_kill=${opts.prefer_pid_kill === true}`);
+      try {
+        tracked.process.kill(signal);
+      } catch (err) {
+        return this.createErrorResponse(
+          `Failed to signal Godot editor process: ${err instanceof Error ? err.message : String(err)}`,
+          ['Process may have already exited', 'Check editor-status for current state'],
+        );
+      }
+      const launchedAtMs = tracked.launchedAt;
+      // NOTE: do not null editorProcess here — let the on('exit') listener own
+      // the null transition so it fires exactly when the OS reports the exit.
+      const warningText = bridgeWasAvailable
+        ? 'guards bypassed via prefer_pid_kill=true (bridge was available; guards skipped by caller request)'
+        : 'guards bypassed (bridge unavailable); unsaved changes may be lost';
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: true,
+            path: 'pid_kill',
+            signal,
+            warning: warningText,
+            launched_at: new Date(launchedAtMs).toISOString(),
+          }, null, 2),
+        }],
+      };
+    }
+
+    if (!bridgeConnected) {
+      return this.createErrorResponse(
+        'Godot Editor not connected. No bridge channel; no tracked PID. Cannot close.',
+        [
+          'Launch the editor via launch_editor or open it manually',
+          'If the editor is open but bridge unreachable, check editor-status.bridgeAvailable',
+          'For headless Godot this is expected — there is no editor to close',
+        ]
+      );
+    }
+
+    // Path A: bridge IPC dispatch. Addon enforces safety guards.
+    console.error(`[close_editor] path=bridge_ipc force=${opts.force === true} save_first=${opts.save_first === true} launched_by_mcp=${hasTrackedPid}`);
+    try {
+      const result = await this.godotBridge.invokeTool('close_editor', {
+        force: opts.force === true,
+        save_first: opts.save_first === true,
+      });
+      const resultObj = (result && typeof result === 'object') ? (result as Record<string, unknown>) : { value: result };
+      const addonReportedOk = resultObj.ok === true;
+      // C2: do NOT null editorProcess here. The addon's get_tree().quit() is
+      // deferred; the editor is still alive when this response arrives. The
+      // spawn on('exit') listener clears editorProcess when the OS reports
+      // the actual exit (line ~2031 in handleLaunchEditor).
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ path: 'bridge_ipc', ...resultObj }, null, 2) }],
+        // Propagate addon refusals as isError so callers (especially
+        // handleRestartEditor) can detect them without parsing the inner JSON.
+        ...(addonReportedOk ? {} : { isError: true }),
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ok: false,
+            path: 'bridge_ipc',
+            error: err instanceof Error ? err.message : String(err),
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  /**
+   * Handle the restart_editor tool — close + relaunch.
+   * Inherits guard refusals from inner close_editor (C3: refusal detection
+   * via isError propagation). Forwards force / save_first / force_kill /
+   * i_understand_data_loss_risk so callers can chain through.
+   */
+  private async handleRestartEditor(args: any): Promise<any> {
+    const opts = (args || {}) as {
+      projectPath?: string;
+      force?: boolean;
+      save_first?: boolean;
+      force_kill?: boolean;
+      i_understand_data_loss_risk?: boolean;
+    };
+    if (!opts.projectPath) {
+      return this.createErrorResponse('projectPath required for restart_editor', [
+        'Pass the project directory path containing project.godot',
+      ]);
+    }
+    const closeResult = await this.handleCloseEditor({
+      force: opts.force,
+      save_first: opts.save_first,
+      force_kill: opts.force_kill,
+      i_understand_data_loss_risk: opts.i_understand_data_loss_risk,
+    });
+    // C3: addon guard refusals (e.g., fs_scanning) now propagate as isError,
+    // so this check correctly stops the restart chain rather than racing into
+    // a launch on top of a still-open editor.
+    if ((closeResult as { isError?: boolean }).isError === true) {
+      return closeResult;
+    }
+    // Poll until bridge disconnects (5s cap).
+    const disconnectDeadline = Date.now() + 5000;
+    while (this.godotBridge.isConnected() && Date.now() < disconnectDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (this.godotBridge.isConnected()) {
+      return this.createErrorResponse('Editor did not disconnect within 5s of close_editor', [
+        'Editor may be stuck; try editor-close with force_kill=true',
+        'Then call launch_editor manually',
+      ]);
+    }
+    const launchResult = await this.handleLaunchEditor({ projectPath: opts.projectPath });
+    if ((launchResult as { isError?: boolean }).isError === true) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({
+          ok: false,
+          phase: 'launch_after_close',
+          suggestion: 'editor closed but relaunch failed; call launch_editor manually',
+          launch_error: launchResult,
+        }, null, 2) }],
+        isError: true,
+      };
+    }
+    // Poll until bridge reconnects (15s cap).
+    const reconnectDeadline = Date.now() + 15000;
+    while (!this.godotBridge.isConnected() && Date.now() < reconnectDeadline) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify({
+        ok: true,
+        bridge_reconnected: this.godotBridge.isConnected(),
+        editor_pid: this.editorProcess?.process?.pid ?? null,
+        launched_at: this.editorProcess ? new Date(this.editorProcess.launchedAt).toISOString() : null,
+        project_path: this.editorProcess?.projectPath ?? null,
+      }, null, 2) }],
     };
   }
 
@@ -5353,13 +5835,17 @@ class GodotServer {
    */
   private async handleGetRuntimeStatus(args: any) {
     args = this.normalizeParameters(args);
-    
+
     if (!args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
         ['Provide a valid path to a Godot project directory']
       );
     }
+
+    // Resolve once so diagnostic messages report the actual port the env
+    // override pointed handleRuntimeCommand at — not a stale 7777 literal.
+    const runtimePort = resolveDefaultRuntimePort();
 
     try {
       const runtime = await this.handleRuntimeCommand('ping', {});
@@ -5399,7 +5885,7 @@ class GodotServer {
               status: 'process_running_runtime_disconnected',
               processActive: true,
               runtimeAddon: 'unreachable',
-              note: 'A Godot process is active, but the runtime addon did not respond on port 7777.',
+              note: `A Godot process is active, but the runtime addon did not respond on port ${runtimePort}.`,
               runtimeResponse: runtimeText,
             }, null, 2),
           }],
@@ -6462,48 +6948,58 @@ class GodotServer {
    */
   async run() {
     try {
-      // Detect Godot path before starting the server
-      await this.detectGodotPath();
-
-      if (!this.godotPath) {
-        console.error('[SERVER] Failed to find a valid Godot executable path');
-        console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
-        process.exit(1);
-      }
-
-      // Check if the path is valid
-      const isValid = await this.isValidGodotPath(this.godotPath);
-
-      if (!isValid) {
-        if (this.strictPathValidation) {
-          // In strict mode, exit if the path is invalid
-          console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] Please set a valid GODOT_PATH environment variable or provide a valid path');
-          process.exit(1);
-        } else {
-          // In compatibility mode, warn but continue with the default path
-          console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
-          console.error('[SERVER] This may cause issues when executing Godot commands');
-          console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
-        }
-      }
-
-      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
-
+      // Attach the stdio MCP transport FIRST so the server can respond
+      // to protocol-level messages (initialize, prompts/list,
+      // tools/list) within ~100ms of spawn. Godot-path detection runs
+      // afterwards in the background: on WSL→Windows, `execFileAsync`
+      // spawning a Windows `.exe` from WSL can take 5–10s cold due to
+      // binfmt_misc + Defender, which previously gated the MCP
+      // handshake and starved `scripts/smoke-test.mjs` (plus any other
+      // MCP supervisor) that expected an `initialize` response inside
+      // a few seconds.
       const transport = new StdioServerTransport();
+      // Standard MCP-stdio shutdown signal: when the parent (Claude Code,
+      // MCP Inspector, etc.) closes stdin, the transport emits onclose.
+      // Without this hook, gopeak survives its parent and orphans onto
+      // PID 1 — the root cause of the bridge-reliability incidents
+      // documented in wiki/topics/mcp_fork_notes.md (orphan gopeaks holding
+      // :6505 across sessions, leaving the editor plugin paired with a
+      // dead bridge). See feedback_mcp_bridge_reliability memory.
+      transport.onclose = () => {
+        if (!this.shutdownInitiated) {
+          console.error('[SERVER] Parent stdio closed (transport onclose) — shutting down gracefully');
+        }
+        void this.handleShutdown('stdio:transport-close', 0);
+      };
       await this.server.connect(transport);
       console.error('Godot MCP server running on stdio');
+
+      this.godotReadyPromise = this.detectAndValidateGodotPath();
+
+      // Start the Godot Editor Bridge after the transport is live but
+      // without awaiting the Godot-path probe. Bridge start is fast
+      // (localhost WebSocket) and its failure is non-fatal.
 
       // Start the Godot Editor Bridge (WebSocket server for editor plugin).
       // Bridge startup issues should not take down the stdio MCP server.
       try {
         await this.godotBridge.start();
         this.bridgeStartupError = null;
+        this.bridgeStartupErrorInfo = null;
         const bridgeStatus = this.godotBridge.getStatus();
-        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}`);
+        const selfTest = bridgeStatus.bridgeSelfTest;
+        const selfTestNote = selfTest === null
+          ? ''
+          : ` (self-test ${selfTest.pass ? `OK in ${selfTest.durationMs}ms` : `FAILED: ${selfTest.error ?? 'unknown'}`})`;
+        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}${selfTestNote}`);
       } catch (bridgeError) {
         const bridgeMessage = bridgeError instanceof Error ? bridgeError.message : String(bridgeError);
         this.bridgeStartupError = bridgeMessage;
+        if (bridgeError instanceof BridgeStartupError) {
+          this.bridgeStartupErrorInfo = bridgeError.info;
+        } else {
+          this.bridgeStartupErrorInfo = null;
+        }
         console.error(`[SERVER] Warning: Godot Editor Bridge failed to start: ${bridgeMessage}`);
         console.error('[SERVER] Continuing without bridge-backed editor tools.');
       }

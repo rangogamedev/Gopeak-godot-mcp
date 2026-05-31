@@ -303,6 +303,7 @@ install_editor_plugin() {
         "plugin.gd"
         "mcp_client.gd"
         "tool_executor.gd"
+        "dap_relay.gd"
         "tools/animation_tools.gd"
         "tools/resource_tools.gd"
         "tools/scene_tools.gd"
