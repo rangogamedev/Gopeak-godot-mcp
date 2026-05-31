@@ -202,6 +202,10 @@ async function testPongTimeoutEviction() {
     await delay(KEEPALIVE * 8);
     assert.equal(bridge.getStatus().connected, false, 'half-open socket must be evicted after missed pongs');
     assert.equal(sock.readyState, 3, 'evicted socket must be terminated');
+    // Real ws.terminate() emits a late 'close'; the idempotent handleDisconnect
+    // guard must swallow it rather than double-fire a disconnect.
+    sock.emit('close', 1006, Buffer.from('late close after eviction'));
+    assert.equal(bridge.getStatus().connected, false, 'late close after eviction must keep bridge disconnected');
   }
 
   // Case 2: a socket with a pending tool request is NOT evicted, even though it
