@@ -32,6 +32,7 @@ const RUNTIME_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_runtime/mcp_r
 const TOOL_DEFS_SOURCE = readFileSync(new URL('./src/tool-definitions.ts', import.meta.url), 'utf8');
 const TOOL_GROUPS_SOURCE = readFileSync(new URL('./src/tool-groups.ts', import.meta.url), 'utf8');
 const TOOL_EXECUTOR_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/tool_executor.gd', import.meta.url), 'utf8');
+const MCP_CLIENT_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/mcp_client.gd', import.meta.url), 'utf8');
 
 function makeRequest(method, params, id) {
   return JSON.stringify({ jsonrpc: '2.0', method, params, id }) + '\n';
@@ -113,6 +114,13 @@ class FakeSocket extends EventEmitter {
     this.readyState = 3;
     this.emit('close', code, Buffer.from(reason));
   }
+
+  // Mirrors ws.WebSocket#terminate: forcefully drop the socket. We mark it
+  // CLOSED but do not auto-emit 'close' here so tests can drive the late-close
+  // event explicitly when they want to exercise the stale-socket guard.
+  terminate() {
+    this.readyState = 3;
+  }
 }
 
 function resolveGodotPath() {
@@ -148,6 +156,79 @@ function testStaleDisconnectRegression() {
 
   second.emit('close', 1000, Buffer.from('active socket closed'));
   assert.equal(bridge.getStatus().connected, false, 'active socket close should disconnect bridge');
+}
+
+// Defect C: a new Godot connection must take over from a still-OPEN previous
+// socket (last-writer-wins) instead of being rejected. Previously a reconnect
+// arriving while a half-open zombie socket was still OPEN got bounced with code
+// 4000 and the editor stayed locked out for minutes.
+function testLastWriterWinsTakeover() {
+  const bridge = createBridge(0, 1000, '127.0.0.1');
+  const oldSock = new FakeSocket('old');
+  const newSock = new FakeSocket('new');
+
+  bridge.handleConnection(oldSock);
+  assert.equal(bridge.getStatus().connected, true, 'first connection should be accepted');
+
+  // oldSock is still OPEN (readyState 1) — the takeover branch must engage.
+  bridge.handleConnection(newSock);
+  assert.equal(bridge.getStatus().connected, true, 'new connection should take over, not be rejected');
+  assert.equal(oldSock.readyState, 3, 'old socket should have been terminated on takeover');
+
+  // A late close from the terminated old socket must not disconnect the bridge.
+  oldSock.emit('close', 1006, Buffer.from('late close from terminated socket'));
+  assert.equal(bridge.getStatus().connected, true, 'stale close from old socket must be ignored');
+
+  // The new socket closing does disconnect.
+  newSock.emit('close', 1000, Buffer.from('active socket closed'));
+  assert.equal(bridge.getStatus().connected, false, 'new socket close should disconnect bridge');
+}
+
+// Defect B: an idle half-open socket (no pong replies) is evicted after
+// PONG_MISS_LIMIT keepalive intervals; a socket with a tool in flight is NOT
+// evicted (Godot's main thread is blocked during a synchronous tool and can't
+// reply to pings — counting those misses would false-evict a healthy editor).
+async function testPongTimeoutEviction() {
+  // Fast keepalive (20ms) so the test runs quickly; generous tool timeout (5s)
+  // so the in-flight request below doesn't resolve during the test window.
+  const KEEPALIVE = 20;
+
+  // Case 1: idle half-open socket gets evicted.
+  {
+    const bridge = createBridge(0, 5000, '127.0.0.1', KEEPALIVE);
+    const sock = new FakeSocket('idle');
+    bridge.handleConnection(sock);
+    assert.equal(bridge.getStatus().connected, true, 'socket should start connected');
+    // Never send a pong. After >= 3 intervals it must be evicted.
+    await delay(KEEPALIVE * 8);
+    assert.equal(bridge.getStatus().connected, false, 'half-open socket must be evicted after missed pongs');
+    assert.equal(sock.readyState, 3, 'evicted socket must be terminated');
+  }
+
+  // Case 2: a socket with a pending tool request is NOT evicted, even though it
+  // never replies to pings (simulating a blocked main thread).
+  {
+    const bridge = createBridge(0, 5000, '127.0.0.1', KEEPALIVE);
+    const sock = new FakeSocket('busy');
+    bridge.handleConnection(sock);
+    // Start a tool call that stays pending (FakeSocket never sends tool_result).
+    const pending = bridge.invokeTool('regression_noop_tool', {});
+    pending.catch(() => {}); // avoid unhandled rejection when we tear down below
+    await delay(KEEPALIVE * 8);
+    assert.equal(bridge.getStatus().connected, true, 'socket with in-flight tool must NOT be evicted');
+    // Tear down: closing rejects the pending request and clears its timeout.
+    sock.close();
+  }
+}
+
+// Defect A: source-level guard that mcp_client.gd re-arms reconnection after a
+// connection attempt that fails before the socket ever opens. Mirrors the other
+// addon source-grep regressions in this file.
+function testMcpClientReconnectHardening() {
+  assert.match(MCP_CLIENT_SOURCE, /var _connecting := false/, 'mcp_client.gd must declare the _connecting flag');
+  assert.match(MCP_CLIENT_SOURCE, /_connecting = true/, 'mcp_client.gd must set _connecting after a successful connect_to_url');
+  assert.match(MCP_CLIENT_SOURCE, /_connecting and _should_reconnect/, 'mcp_client.gd must reschedule reconnect on a failed connect attempt');
+  assert.match(MCP_CLIENT_SOURCE, /_reconnect_timer\.is_stopped\(\)/, 'mcp_client.gd must guard reschedule with is_stopped() to preserve backoff');
 }
 
 function testSceneToolsVectorRegression() {
@@ -1220,6 +1301,9 @@ function testEditorLifecycleTracking() {
 
 async function main() {
   testStaleDisconnectRegression();
+  testLastWriterWinsTakeover();
+  await testPongTimeoutEviction();
+  testMcpClientReconnectHardening();
   testWSLInterop();
   testSceneToolsVectorRegression();
   testStartupActiveGroups();
