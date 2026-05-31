@@ -18,6 +18,10 @@ const LOG_PATH := "user://mcp_editor_client.log"
 var socket: WebSocketPeer = WebSocketPeer.new()
 var server_url: String = DEFAULT_URL
 var _is_connected := false
+# True between a successful `connect_to_url` and either STATE_OPEN (success) or
+# STATE_CLOSED (the attempt failed before opening). Lets `_process` tell a failed
+# *attempt* apart from an idle socket so it can re-arm the reconnect backoff.
+var _connecting := false
 var _reconnect_timer: Timer
 var _current_reconnect_delay := RECONNECT_DELAY
 var _should_reconnect := true
@@ -74,8 +78,7 @@ func _process(_delta: float) -> void:
 		return
 
 	if socket.get_ready_state() == WebSocketPeer.STATE_CLOSED:
-		if _is_connected:
-			_handle_disconnect()
+		_handle_closed_state()
 		return
 
 	socket.poll()
@@ -93,8 +96,26 @@ func _process(_delta: float) -> void:
 			pass
 
 		WebSocketPeer.STATE_CLOSED:
-			if _is_connected:
-				_handle_disconnect()
+			_handle_closed_state()
+
+
+# Centralised STATE_CLOSED handling. A socket reaches CLOSED either because an
+# established connection dropped (`_is_connected`) or because a connection
+# *attempt* failed before STATE_OPEN was ever reached (`_connecting`). The latter
+# was previously a dead-end: `connect_to_url` returns OK, the socket goes
+# CONNECTING -> CLOSED on a refused/dropped handshake (e.g. during a bridge
+# ownership gap), and nothing rescheduled a reconnect — so the client went
+# permanently silent until the editor was restarted. Both paths now re-arm the
+# backoff timer; the `is_stopped()` guard preserves an already-running backoff
+# and prevents rescheduling every frame.
+func _handle_closed_state() -> void:
+	if _is_connected:
+		_handle_disconnect()
+	elif _connecting and _should_reconnect:
+		_connecting = false
+		_log("WARN", "connect_failed", "url=%s socket closed before open" % server_url)
+		if _reconnect_timer.is_stopped():
+			_schedule_reconnect()
 
 
 func connect_to_server(url: String = "") -> void:
@@ -146,6 +167,7 @@ func _resolve_server_url(explicit_url: String) -> String:
 
 func disconnect_from_server() -> void:
 	_should_reconnect = false
+	_connecting = false
 	if _reconnect_timer:
 		_reconnect_timer.stop()
 	if socket.get_ready_state() == WebSocketPeer.STATE_OPEN:
@@ -160,12 +182,16 @@ func _attempt_connection() -> void:
 
 	var err := socket.connect_to_url(server_url)
 	if err != OK:
+		_connecting = false
 		_log("ERROR", "connect_to_url_failed", "url=%s err=%d" % [server_url, err])
 		push_error("[MCP Editor] Failed to connect: %s" % err)
 		_schedule_reconnect()
+	else:
+		_connecting = true
 
 
 func _handle_connect() -> void:
+	_connecting = false
 	_is_connected = true
 	_current_reconnect_delay = RECONNECT_DELAY
 

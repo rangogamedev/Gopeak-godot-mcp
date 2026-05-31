@@ -13,7 +13,11 @@ const DEFAULT_PORT = 6505;
 const DEFAULT_HOST = process.platform === 'linux' && release().toLowerCase().includes('microsoft') ? '0.0.0.0' : '127.0.0.1';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 10_000;
-const SECOND_CONNECTION_CLOSE_CODE = 4000;
+// Evict a Godot socket after this many consecutive keepalive intervals with no
+// pong. At the default 10s interval that's ~30s of silence. The counter is only
+// advanced while no tool is in flight (see startKeepalive), so a long
+// synchronous editor tool that blocks Godot's main thread can't trip it.
+const PONG_MISS_LIMIT = 3;
 const BRIDGE_PORT_ENV_KEYS = ['GODOT_BRIDGE_PORT', 'MCP_BRIDGE_PORT', 'GOPEAK_BRIDGE_PORT'] as const;
 const BRIDGE_HOST_ENV_KEYS = ['GODOT_BRIDGE_HOST', 'MCP_BRIDGE_HOST', 'GOPEAK_BRIDGE_HOST'] as const;
 const BRIDGE_VERSION = (() => {
@@ -494,6 +498,7 @@ export class GodotBridge extends EventEmitter {
   private vizWss: WebSocketServer | null = null;
   private socket: WebSocket | null = null;
   private pingInterval: NodeJS.Timeout | null = null;
+  private missedPongs = 0;
   private connectionInfo: GodotConnectionInfo | null = null;
   private pendingRequests = new Map<string, PendingRequest>();
   private resourceQueues = new Map<string, Promise<void>>();
@@ -507,6 +512,8 @@ export class GodotBridge extends EventEmitter {
     private readonly port: number = DEFAULT_PORT,
     private readonly host: string = DEFAULT_HOST,
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    // Overridable so tests can drive the keepalive/pong-timeout loop fast.
+    private readonly keepaliveIntervalMs: number = KEEPALIVE_INTERVAL_MS,
   ) {
     super();
     this.registerProcessExitHandlers();
@@ -946,15 +953,28 @@ export class GodotBridge extends EventEmitter {
 
   private handleConnection(nextSocket: WebSocket): void {
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
-      this.log('warn', 'Rejecting second Godot connection');
-      nextSocket.close(SECOND_CONNECTION_CLOSE_CODE, 'Godot already connected');
-      return;
+      // Last-writer-wins. The editor client is a singleton, so a fresh inbound
+      // connection is authoritative — the existing socket is either being
+      // replaced after a clean editor reconnect or is a half-open zombie (the
+      // relay/editor dropped without a TCP FIN). Previously we rejected the new
+      // connection with code 4000, which locked a legitimately reconnecting
+      // editor out until the dead TCP eventually timed out (minutes). Tear the
+      // old one down and take over. handleDisconnect is passed the OLD socket,
+      // so when its late `close` fires the stale-socket guard makes it a no-op.
+      this.log('warn', 'Taking over Godot connection from a previous/stale socket (last-writer-wins)');
+      const previousSocket = this.socket;
+      this.handleDisconnect(previousSocket, new Error('Replaced by a new Godot connection'));
+      previousSocket.terminate();
     }
 
     this.socket = nextSocket;
     this.connectionInfo = {
       connectedAt: new Date(),
+      // Seed the pong clock so the first keepalive interval can't false-evict a
+      // brand-new connection before it has had a chance to reply.
+      lastPongAt: new Date(),
     };
+    this.missedPongs = 0;
 
     this.startKeepalive();
     this.log('info', 'Godot editor connected');
@@ -1036,6 +1056,7 @@ export class GodotBridge extends EventEmitter {
         if (this.connectionInfo) {
           this.connectionInfo.lastPongAt = new Date();
         }
+        this.missedPongs = 0;
         return;
     }
   }
@@ -1104,13 +1125,31 @@ export class GodotBridge extends EventEmitter {
         return;
       }
 
+      // Pong-timeout / half-open detection. Only advance the missed-pong
+      // counter while NO tool is in flight: a synchronous editor tool blocks
+      // Godot's main thread (and therefore its pong replies) for up to the tool
+      // timeout, so counting misses during that window would false-evict a
+      // healthy-but-busy editor. When the queue is empty, an unanswered socket
+      // is torn down after PONG_MISS_LIMIT intervals (~30s at the default),
+      // clearing the false `connected:true` and unblocking the next reconnect.
+      if (this.pendingRequests.size === 0) {
+        this.missedPongs += 1;
+        if (this.missedPongs >= PONG_MISS_LIMIT) {
+          this.log('warn', `Evicting Godot socket after ${this.missedPongs} missed pongs (half-open connection)`);
+          const deadSocket = this.socket;
+          this.handleDisconnect(deadSocket, new Error('Pong timeout — half-open Godot connection'));
+          deadSocket?.terminate();
+          return;
+        }
+      }
+
       try {
         const ping: PingMessage = { type: 'ping' };
         this.sendMessage(ping);
       } catch (error) {
         this.log('warn', `Failed to send ping: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, KEEPALIVE_INTERVAL_MS);
+    }, this.keepaliveIntervalMs);
   }
 
   private stopKeepalive(): void {
@@ -1123,12 +1162,19 @@ export class GodotBridge extends EventEmitter {
   }
 
   private handleDisconnect(disconnectedSocket: WebSocket | null, reason: Error): void {
-    if (disconnectedSocket && this.socket && disconnectedSocket !== this.socket) {
+    // Ignore disconnect events that don't refer to the current socket. Covers
+    // two cases: (1) a stale socket whose `close` fires after it was already
+    // replaced by a newer connection (last-writer-wins takeover), and (2) a
+    // socket we already tore down — a forced `terminate()` emits a late `close`
+    // after we nulled `this.socket`, which would otherwise emit a second
+    // spurious `godot_disconnected`.
+    if (disconnectedSocket && disconnectedSocket !== this.socket) {
       this.log('debug', 'Ignoring stale Godot socket disconnect event');
       return;
     }
 
     this.stopKeepalive();
+    this.missedPongs = 0;
 
     this.socket = null;
     this.connectionInfo = null;
@@ -1241,6 +1287,6 @@ export function getDefaultBridge(): GodotBridge {
   return defaultBridge;
 }
 
-export function createBridge(port?: number, timeoutMs?: number, host?: string): GodotBridge {
-  return new GodotBridge(port, host, timeoutMs);
+export function createBridge(port?: number, timeoutMs?: number, host?: string, keepaliveIntervalMs?: number): GodotBridge {
+  return new GodotBridge(port, host, timeoutMs, keepaliveIntervalMs);
 }
