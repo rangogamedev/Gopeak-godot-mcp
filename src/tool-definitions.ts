@@ -60,7 +60,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         },
         {
           name: 'close_editor',
-          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Three-stage safety: (1) if a game-debug session is active, it is stopped first. (2) HITL gate: if the editor was NOT launched by this MCP server (launched_by_mcp=false), refuses by default — caller must opt in via force=true paired with i_understand_data_loss_risk=true OR via prefer_pid_kill=true. (3) Bridge-IPC path (preferred) enforces addon guards: fs_scanning (FS reimport in progress), modal_open (visible AcceptDialog), save_blocked (any open scene path is read-only). Auto-saves all open scenes before quit by default. Fallback: PID-kill SIGTERM/SIGKILL when bridge is disconnected but editor was launched by this MCP server.',
+          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Three-stage safety: (1) if a run_project game process is active, it is stopped first (an in-editor Play-button game is terminated with the editor; use stop_playing_scene to stop just that without closing the editor). (2) HITL gate: if the editor was NOT launched by this MCP server (launched_by_mcp=false), refuses by default — caller must opt in via force=true paired with i_understand_data_loss_risk=true OR via prefer_pid_kill=true. (3) Bridge-IPC path (preferred) enforces addon guards: fs_scanning (FS reimport in progress), modal_open (visible AcceptDialog), save_blocked (any open scene path is read-only). Auto-saves all open scenes before quit by default. Fallback: PID-kill SIGTERM/SIGKILL when bridge is disconnected but editor was launched by this MCP server.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -90,6 +90,32 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         {
           name: 'get_fs_scanning_status',
           description: 'Probe the Godot editor\'s resource filesystem to see if a scan/reimport is in progress. Returns { ok: true, is_scanning: bool }. Use to poll between fs_scanning refusals from close_editor — when is_scanning flips to false, the close is safe to retry.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'get_play_state',
+          description: 'Query whether the Godot editor is currently running a game via the Play button (or play_scene). Returns { ok: true, is_playing: bool, played_scene: string }. This is the IN-EDITOR debug session — distinct from a process started by run_project (that one shows under get_editor_status.active/stop with stop_project). Use before play_scene/stop_playing_scene, or to detect a debug game a human started that the agent should be aware of.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'play_scene',
+          description: 'Start a game in the Godot editor, equivalent to pressing Play. With no scene_path, plays the project main scene; if scene_path matches the open scene, plays the current scene; otherwise plays that specific scene. This drives the IN-EDITOR debug runner (reachable by runtime introspection on this session\'s allocated runtime port). Distinct from run_project, which spawns a separate Godot process. Stop it with stop_playing_scene.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              scene_path: { type: 'string', description: 'Optional res:// path of the scene to play. Omit to play the project main scene.' },
+            },
+          },
+        },
+        {
+          name: 'stop_playing_scene',
+          description: 'Stop the in-editor debug game (equivalent to the editor Stop button). Returns { ok: true, was_playing: bool }; no-op when nothing is playing. IMPORTANT: this only stops a game started via the editor Play button or play_scene. To stop a process started by run_project, use stop_project instead.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -2275,7 +2301,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         // Editor Plugin Bridge Status
         {
           name: 'get_editor_status',
-          description: 'Returns the connection status of the Godot Editor Plugin bridge. Use to check if the editor is connected before using scene/resource tools that require the editor plugin.',
+          description: 'Returns the connection status of the Godot Editor Plugin bridge. Use to check if the editor is connected before using scene/resource tools that require the editor plugin. Also reports multi-session fields: session_project_path, project_gated, allocated_ports {bridge,runtime,dap_relay}, and editor_play_state {is_playing, played_scene} — the latter makes the agent aware of an in-editor Play-button debug game (stop it with stop_playing_scene).',
           inputSchema: {
             type: 'object',
             properties: {},

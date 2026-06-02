@@ -167,9 +167,36 @@ func _spawn_dap_relay_if_enabled() -> void:
 	if not enabled:
 		return
 	var port: int = int(ProjectSettings.get_setting(SETTING_DAP_RELAY_PORT, DAP_RELAY_DEFAULT_PORT))
+	# Multi-session: prefer this session's allocated relay port from the gopeak
+	# discovery file, but only when the user hasn't overridden the setting (still
+	# the default), so a committed project value is preserved.
+	if port == DAP_RELAY_DEFAULT_PORT:
+		var discovery_port := _read_discovery_dap_relay_port()
+		if discovery_port > 0:
+			port = discovery_port
 	_dap_relay = McpDapRelayScript.new(port)
 	_dap_relay.name = "MCPDapRelay"
 	add_child(_dap_relay)
+
+
+# Read the per-session DAP relay port from the gopeak discovery file. Returns 0
+# when absent/malformed so the caller keeps the default/user value.
+func _read_discovery_dap_relay_port() -> int:
+	var path := "res://.gopeak/bridge.json"
+	if not FileAccess.file_exists(path):
+		return 0
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return 0
+	var raw := f.get_as_text()
+	f.close()
+	var data = JSON.parse_string(raw)
+	if not data is Dictionary:
+		return 0
+	var port := int(data.get("dap_relay_port", 0))
+	if port >= 1024 and port <= 65535:
+		return port
+	return 0
 
 
 func _on_tool_requested(request_id: String, tool_name: String, args: Dictionary) -> void:

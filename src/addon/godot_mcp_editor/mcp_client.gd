@@ -11,6 +11,10 @@ const DEFAULT_HOST := "127.0.0.1"
 const DEFAULT_PORT := 6505
 const SETTING_BRIDGE_HOST := "mcp/editor/bridge_host"
 const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
+# Per-session discovery file written by the gopeak MCP server into the project.
+# Lets each worktree's editor find its own session's auto-allocated bridge port
+# (multi-session isolation) with zero manual config.
+const DISCOVERY_FILE := "res://.gopeak/bridge.json"
 const RECONNECT_DELAY := 3.0
 const MAX_RECONNECT_DELAY := 30.0
 const LOG_PATH := "user://mcp_editor_client.log"
@@ -129,6 +133,15 @@ func _resolve_server_url(explicit_url: String) -> String:
 	if explicit_url != "":
 		return explicit_url
 
+	# Layer 0: per-session discovery file written by gopeak. Highest precedence
+	# (above ProjectSettings and env) because it is session-specific: the
+	# shared user-scope GOPEAK_BRIDGE_PORT env and any committed
+	# mcp/editor/bridge_port are identical across worktrees and would otherwise
+	# pin every editor to one bridge. Falls through if the file is absent/stale.
+	var discovery_url := _read_discovery_file_url()
+	if discovery_url != "":
+		return discovery_url
+
 	# Resolution order: ProjectSettings override → env override → default.
 	# ProjectSettings is the designer-facing knob visible in Project Settings UI;
 	# env vars remain as a non-editor override layer (CI, headless, ad-hoc).
@@ -162,6 +175,33 @@ func _resolve_server_url(explicit_url: String) -> String:
 				port = parsed_port
 				break
 
+	return "ws://%s:%d/godot" % [host, port]
+
+
+# Read the gopeak-written discovery file and build a bridge URL from it.
+# Returns "" when the file is absent, malformed, or has an invalid port so the
+# caller falls through to the env/ProjectSettings/default layers.
+func _read_discovery_file_url() -> String:
+	if not FileAccess.file_exists(DISCOVERY_FILE):
+		return ""
+	var f := FileAccess.open(DISCOVERY_FILE, FileAccess.READ)
+	if f == null:
+		return ""
+	var raw := f.get_as_text()
+	f.close()
+	var data = JSON.parse_string(raw)
+	if not data is Dictionary:
+		return ""
+	var port := int(data.get("bridge_port", 0))
+	if port < 1 or port > 65535:
+		return ""
+	var host := str(data.get("bridge_host", "")).strip_edges()
+	# The bridge records its actual bound host (0.0.0.0 on WSL so Windows Godot
+	# can reach it). Connect via the IPv4 loopback literal: WSL2 forwards
+	# 127.0.0.1 to the WSL-side service, and the literal avoids the ~30s AAAA
+	# (IPv6) DNS fallback that "localhost" triggers on Windows.
+	if host.is_empty() or host == "0.0.0.0" or host == "::" or host == "0:0:0:0:0:0:0:0":
+		host = DEFAULT_HOST
 	return "ws://%s:%d/godot" % [host, port]
 
 
@@ -225,6 +265,14 @@ func _schedule_reconnect() -> void:
 
 
 func _on_reconnect_timer() -> void:
+	# Re-resolve the URL each attempt so a newly-written (or changed) discovery
+	# file — e.g. this session's gopeak coming up on a freshly allocated port —
+	# is picked up within one backoff cycle instead of staying pinned to a
+	# stale port for the editor's lifetime.
+	var fresh_url := _resolve_server_url("")
+	if fresh_url != server_url:
+		_log("INFO", "url_updated", "old=%s new=%s" % [server_url, fresh_url])
+		server_url = fresh_url
 	_log("INFO", "reconnect_timer_fired", "")
 	_attempt_connection()
 

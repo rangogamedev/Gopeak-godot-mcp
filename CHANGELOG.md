@@ -4,6 +4,20 @@ All notable changes to GoPeak (godot-mcp) will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Multi-session support: multiple agents/worktrees can drive Godot at once.** Each gopeak instance auto-allocates a free bridge port (the configured port is now a base hint, not a hard pin) and derives its runtime + DAP-relay ports from that offset, so concurrent worktrees never collide. A single session with free defaults still uses `6505`/`7777`/`6016` unchanged.
+- **Per-project discovery file** `<project>/.gopeak/bridge.json`, written by the server and read by the editor + runtime addons so each project's Godot connects to *its* session's ports with zero manual config. Addon precedence: discovery file → env → Project Settings → default. Add `.gopeak/` to your project's `.gitignore`.
+- **Bridge project-path gating**: the bridge rejects any editor whose `godot_ready` project path doesn't match the project this session owns, so a stray editor can never hijack another session's connection (no more cross-session eviction).
+- **Debug-game control + awareness**: new `play_scene`, `stop_playing_scene`, and `get_play_state` tools drive/stop the in-editor Play-button game (distinct from `run_project`/`stop_project`). `get_editor_status` now reports `editor_play_state`, `session_project_path`, and `allocated_ports`, so the agent is aware of a debug game even one a human started.
+- `GOPEAK_PROJECT_PATH` and `GOPEAK_RUNTIME_BIND_HOST` environment variables.
+
+### Changed
+- An occupied bridge port no longer leaves the server bridge-unavailable — it auto-allocates the next free port and comes up healthy.
+- Runtime control socket now binds loopback (`127.0.0.1`) by default for security, and `0.0.0.0` only in WSL→Windows mode (a WSL-safe superset of the upstream issue-38 hardening, so a WSL server can still reach a Windows game).
+
+### Known limitations
+- LSP (`6005`) and raw DAP (`6006`) are global Godot editor settings with no per-instance override; with multiple simultaneous editors only the first binds them, and gopeak reports them unavailable rather than hanging. The DAP relay port is isolated per session.
+
 ### Fixed
 - **WSL: MCP server required a `/mcp` reconnect on nearly every fresh session.** Root cause was launching `node build/index.js` from a `/mnt/c` 9p mount, where loading `node_modules` (worsened by Windows Defender scanning) took ~20–40s and exceeded Claude Code's hard 30s `initialize` timeout. Fix is to run the (unchanged) build from the native Linux ext4 filesystem, dropping cold start to <1s. No server code changes — see README → Installation → D) WSL and `scripts/wsl-setup.sh`.
 
