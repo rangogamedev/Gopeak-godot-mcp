@@ -123,6 +123,12 @@ func _play_scene(args: Dictionary) -> Dictionary:
 	if scene_path.is_empty():
 		EditorInterface.play_main_scene()
 		return { "ok": true, "play_mode": "main_scene" }
+	# Validate the path first: play_custom_scene() returns void and cannot signal
+	# failure, so a missing/unloadable scene would pop an editor error dialog while
+	# the MCP caller still received ok:true (false positive). Mirror the error-return
+	# pattern used by the save-scenes handler below.
+	if not ResourceLoader.exists(scene_path):
+		return { "ok": false, "error": "scene not found: %s" % scene_path }
 	# Always run the explicitly-named scene from disk via play_custom_scene so
 	# the launched scene is exactly the one requested. play_current_scene() plays
 	# the currently-edited tab, which may differ from scene_path and would
