@@ -20,6 +20,8 @@ var _clients: Array[StreamPeerTCP] = []
 var _port: int = DEFAULT_PORT
 var _enabled: bool = true
 var _watched_signals: Dictionary = {}  # { "node_path:signal_name": callable }
+var _discovery_cache: Dictionary = {}
+var _discovery_loaded := false
 
 signal client_connected
 signal client_disconnected
@@ -80,18 +82,23 @@ func _resolve_bind_host() -> String:
 
 
 ## Read the per-session discovery file (if present) as a Dictionary, else {}.
+## Cached after the first read — _resolve_port() and _resolve_bind_host() both
+## consult it once at _ready(), so a single disk round-trip is enough.
 func _read_discovery_data() -> Dictionary:
+	if _discovery_loaded:
+		return _discovery_cache
+	_discovery_loaded = true
 	if not FileAccess.file_exists(DISCOVERY_FILE):
-		return {}
+		return _discovery_cache
 	var f := FileAccess.open(DISCOVERY_FILE, FileAccess.READ)
 	if f == null:
-		return {}
+		return _discovery_cache
 	var raw := f.get_as_text()
 	f.close()
 	var parsed = JSON.parse_string(raw)
 	if parsed is Dictionary:
-		return parsed
-	return {}
+		_discovery_cache = parsed
+	return _discovery_cache
 
 
 func _read_discovery_int(key: String) -> int:
