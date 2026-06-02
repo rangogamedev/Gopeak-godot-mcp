@@ -1377,6 +1377,35 @@ function testBridgeProjectPathGating() {
   }
 }
 
+// A gated socket that never sends godot_ready must be closed after the
+// probation window so its listeners can't accumulate, WITHOUT disturbing an
+// already-adopted matching socket. Uses a tiny injected probation timeout.
+async function testGatedProbationTimeout() {
+  const PROBATION = 30;
+  // A never-identifying socket is closed after the probation window.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1', undefined, PROBATION);
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const silent = new FakeSocket('silent');
+    bridge.handleConnection(silent);
+    assert.equal(bridge.getStatus().connected, false, 'silent gated socket is not adopted');
+    await delay(PROBATION * 4);
+    assert.equal(silent.readyState, 3, 'silent gated socket must be closed after the probation window');
+    assert.equal(bridge.getStatus().connected, false, 'bridge stays disconnected');
+  }
+  // An adopted matching socket must NOT be torn down by a later probation timer.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1', undefined, PROBATION);
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const good = new FakeSocket('good');
+    bridge.handleConnection(good);
+    good.emit('message', Buffer.from(JSON.stringify({ type: 'godot_ready', project_path: '/mnt/c/games/proj-a' })));
+    assert.equal(bridge.getStatus().connected, true, 'matching socket adopted');
+    await delay(PROBATION * 4);
+    assert.equal(bridge.getStatus().connected, true, 'adopted socket must survive past the probation window (timer was cleared)');
+  }
+}
+
 // Discovery-file round-trip: the TS server writes <project>/.gopeak/bridge.json;
 // the editor + runtime addons read res://.gopeak/bridge.json. Source-grep both
 // ends so the contract can't silently drift.
@@ -1494,6 +1523,7 @@ async function main() {
   // Multi-session isolation + close-debug-game suite.
   await testPortAllocationNonCollision();
   testBridgeProjectPathGating();
+  await testGatedProbationTimeout();
   testDiscoveryFileRoundTrip();
   testRuntimeBindHostConfigurable();
   testDebugGameToolsWired();
