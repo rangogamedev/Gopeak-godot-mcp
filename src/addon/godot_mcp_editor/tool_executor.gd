@@ -116,18 +116,17 @@ func _get_play_state(_args: Dictionary) -> Dictionary:
 
 ## Start a scene in the editor (equivalent to the Play button).
 ## Args (optional):
-##   scene_path (String): res:// path to play. Empty → play_main_scene().
-##     If it equals the currently open scene → play_current_scene().
-##     Otherwise → play_custom_scene(scene_path).
+##   scene_path (String): res:// path to play. Empty → play_main_scene();
+##     otherwise → play_custom_scene(scene_path) (runs exactly that scene).
 func _play_scene(args: Dictionary) -> Dictionary:
 	var scene_path: String = str(args.get("scene_path", "")).strip_edges()
 	if scene_path.is_empty():
 		EditorInterface.play_main_scene()
 		return { "ok": true, "play_mode": "main_scene" }
-	var open_scenes: PackedStringArray = EditorInterface.get_open_scenes()
-	if open_scenes.size() > 0 and open_scenes[0] == scene_path:
-		EditorInterface.play_current_scene()
-		return { "ok": true, "play_mode": "current_scene", "scene": scene_path }
+	# Always run the explicitly-named scene from disk via play_custom_scene so
+	# the launched scene is exactly the one requested. play_current_scene() plays
+	# the currently-edited tab, which may differ from scene_path and would
+	# silently launch the wrong stage during multi-worktree testing.
 	EditorInterface.play_custom_scene(scene_path)
 	return { "ok": true, "play_mode": "custom_scene", "scene": scene_path }
 
