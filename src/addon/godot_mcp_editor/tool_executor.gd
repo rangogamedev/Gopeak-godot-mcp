@@ -93,8 +93,53 @@ func _init_tools() -> void:
 
 		# Lifecycle tools
 		"close_editor": [self, "_close_editor"],
-		"get_fs_scanning_status": [self, "_get_fs_scanning_status"]
+		"get_fs_scanning_status": [self, "_get_fs_scanning_status"],
+
+		# Debug-game (editor Play button) tools
+		"get_play_state": [self, "_get_play_state"],
+		"play_scene": [self, "_play_scene"],
+		"stop_playing_scene": [self, "_stop_playing_scene"]
 	}
+
+
+## Report whether the editor is currently running a scene via the Play button.
+## Returns { ok, is_playing, played_scene }. played_scene is "" when not
+## playing or when the engine build predates EditorInterface.get_playing_scene
+## (Godot 4.3+). This is the in-editor debug session — NOT a run_project child.
+func _get_play_state(_args: Dictionary) -> Dictionary:
+	var is_playing: bool = EditorInterface.is_playing_scene()
+	var played := ""
+	if is_playing and EditorInterface.has_method("get_playing_scene"):
+		played = EditorInterface.get_playing_scene()
+	return { "ok": true, "is_playing": is_playing, "played_scene": played }
+
+
+## Start a scene in the editor (equivalent to the Play button).
+## Args (optional):
+##   scene_path (String): res:// path to play. Empty → play_main_scene().
+##     If it equals the currently open scene → play_current_scene().
+##     Otherwise → play_custom_scene(scene_path).
+func _play_scene(args: Dictionary) -> Dictionary:
+	var scene_path: String = str(args.get("scene_path", "")).strip_edges()
+	if scene_path.is_empty():
+		EditorInterface.play_main_scene()
+		return { "ok": true, "play_mode": "main_scene" }
+	var open_scenes: PackedStringArray = EditorInterface.get_open_scenes()
+	if open_scenes.size() > 0 and open_scenes[0] == scene_path:
+		EditorInterface.play_current_scene()
+		return { "ok": true, "play_mode": "current_scene", "scene": scene_path }
+	EditorInterface.play_custom_scene(scene_path)
+	return { "ok": true, "play_mode": "custom_scene", "scene": scene_path }
+
+
+## Stop the currently playing in-editor scene (equivalent to the Stop button).
+## No-op when nothing is playing. Distinct from stop_project, which kills a
+## run_project-spawned child process tracked by the MCP server.
+func _stop_playing_scene(_args: Dictionary) -> Dictionary:
+	if not EditorInterface.is_playing_scene():
+		return { "ok": true, "was_playing": false, "note": "no scene was playing" }
+	EditorInterface.stop_playing_scene()
+	return { "ok": true, "was_playing": true }
 
 
 ## Probe the resource filesystem scanning state without side effects.

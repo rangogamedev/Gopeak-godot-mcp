@@ -5,9 +5,15 @@ extends Node
 ## It starts a TCP server that the MCP server can connect to.
 
 const DEFAULT_PORT = 7777
+const DEFAULT_BIND_HOST = "127.0.0.1"
 const PROTOCOL_VERSION = "1.0"
 const DISABLE_ENV = "GOPEAK_RUNTIME_DISABLED"
 const PORT_ENV_KEYS: Array[String] = ["GOPEAK_RUNTIME_PORT", "GODOT_RUNTIME_PORT", "MCP_RUNTIME_PORT"]
+const BIND_HOST_ENV_KEY = "GOPEAK_RUNTIME_BIND_HOST"
+# Per-session discovery file written by the gopeak MCP server into the project.
+# Lets a manually-launched game pick up this session's allocated runtime port
+# and bind host without any env var (multi-worktree support).
+const DISCOVERY_FILE = "res://.gopeak/bridge.json"
 
 var _server: TCPServer
 var _clients: Array[StreamPeerTCP] = []
@@ -26,11 +32,19 @@ func _ready() -> void:
 	_start_server()
 
 
-## Resolve the runtime listen port. Mirrors resolveDefaultRuntimePort() in
-## src/wsl_interop.ts so the autoload and the MCP server always agree.
-## Env keys are read via OS.get_environment; first valid integer wins.
-## Invalid values emit a warning and fall through to the next key.
+## Resolve the runtime listen port. Resolution order:
+##   0. Discovery file `res://.gopeak/bridge.json` (per-session, written by the
+##      gopeak MCP server). Top precedence — a game launched via the editor
+##      Play button inherits env from a manually-opened editor that does NOT
+##      carry GOPEAK_RUNTIME_PORT, so the file is the reliable channel there.
+##   1. Env keys (GOPEAK_RUNTIME_PORT/...); first valid integer wins (matches
+##      resolveDefaultRuntimePort() in src/wsl_interop.ts).
+##   2. DEFAULT_PORT (single-session / no discovery file).
+## Invalid values emit a warning and fall through.
 func _resolve_port() -> int:
+	var discovery_port := _read_discovery_int("runtime_port")
+	if discovery_port > 0:
+		return discovery_port
 	for key in PORT_ENV_KEYS:
 		if not OS.has_environment(key):
 			continue
@@ -45,6 +59,56 @@ func _resolve_port() -> int:
 			return parsed
 		push_warning("[MCP Runtime] Ignoring out-of-range %s=%d — expected integer 1-65535" % [key, parsed])
 	return DEFAULT_PORT
+
+
+## Resolve the address to bind the control socket to. Defaults to loopback for
+## security (the socket accepts method calls + property writes). Resolution:
+##   1. GOPEAK_RUNTIME_BIND_HOST env (set by gopeak to 0.0.0.0 in WSL→Windows
+##      mode so a WSL gopeak can reach the Windows game via the host IP).
+##   2. Discovery file `runtime_bind_host`.
+##   3. 127.0.0.1 (loopback-only — superset of upstream's hardcoded fix,
+##      WSL-safe because gopeak flips it to 0.0.0.0 only when needed).
+func _resolve_bind_host() -> String:
+	if OS.has_environment(BIND_HOST_ENV_KEY):
+		var raw := OS.get_environment(BIND_HOST_ENV_KEY).strip_edges()
+		if not raw.is_empty():
+			return raw
+	var discovery_host := _read_discovery_string("runtime_bind_host")
+	if not discovery_host.is_empty():
+		return discovery_host
+	return DEFAULT_BIND_HOST
+
+
+## Read the per-session discovery file (if present) as a Dictionary, else {}.
+func _read_discovery_data() -> Dictionary:
+	if not FileAccess.file_exists(DISCOVERY_FILE):
+		return {}
+	var f := FileAccess.open(DISCOVERY_FILE, FileAccess.READ)
+	if f == null:
+		return {}
+	var raw := f.get_as_text()
+	f.close()
+	var parsed = JSON.parse_string(raw)
+	if parsed is Dictionary:
+		return parsed
+	return {}
+
+
+func _read_discovery_int(key: String) -> int:
+	var data := _read_discovery_data()
+	if not data.has(key):
+		return 0
+	var value := int(data[key])
+	if value >= 1 and value <= 65535:
+		return value
+	return 0
+
+
+func _read_discovery_string(key: String) -> String:
+	var data := _read_discovery_data()
+	if not data.has(key):
+		return ""
+	return str(data[key]).strip_edges()
 
 
 func _process(_delta: float) -> void:
@@ -90,13 +154,14 @@ func _start_server() -> void:
 		print("[MCP Runtime] To re-enable, unset %s (do NOT set it in shell rc files; restrict to hooks/CI scripts)" % DISABLE_ENV)
 		return
 	_server = TCPServer.new()
-	var error = _server.listen(_port)
+	var bind_host := _resolve_bind_host()
+	var error = _server.listen(_port, bind_host)
 	if error != OK:
-		push_warning("[MCP Runtime] Bind failed on port %d (error %d) — passive mode (probably second Godot instance holding the port)" % [_port, error])
+		push_warning("[MCP Runtime] Bind failed on %s:%d (error %d) — passive mode (probably second Godot instance holding the port)" % [bind_host, _port, error])
 		_enabled = false
 		_server = null
 	else:
-		print("[MCP Runtime] Server listening on port %d" % _port)
+		print("[MCP Runtime] Server listening on %s:%d" % [bind_host, _port])
 
 
 func _send_welcome(client: StreamPeerTCP) -> void:
