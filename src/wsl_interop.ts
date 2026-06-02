@@ -196,6 +196,36 @@ export function resolveDefaultRuntimeHost(): string {
 }
 
 /**
+ * Resolve the address the Godot runtime autoload (inside the running game)
+ * should bind its control TCP server to. Communicated to the game via the
+ * `GOPEAK_RUNTIME_BIND_HOST` env var (and mirrored into the discovery file).
+ *
+ * Defaults to loopback (`127.0.0.1`) for security — the runtime control socket
+ * accepts method calls and property writes, so it must not be world-reachable.
+ * In WSL→Windows mode it binds `0.0.0.0` instead, because the game runs on
+ * Windows while gopeak runs in WSL and reaches it via the Windows host IP
+ * (`resolveDefaultRuntimeHost`), which loopback would block.
+ *
+ * This is a deliberate WSL-aware superset of upstream's hardcoded `127.0.0.1`
+ * bind (issue-38): same security default, without breaking WSL reachability.
+ *
+ * Resolution order:
+ *   1. `GOPEAK_RUNTIME_BIND_HOST` env override (power users / CI).
+ *   2. `0.0.0.0` when mode is `wsl_windows`.
+ *   3. `127.0.0.1` otherwise.
+ */
+export function resolveDefaultRuntimeBindHost(details: WSLInteropDetails): string {
+  const envOverride = process.env.GOPEAK_RUNTIME_BIND_HOST;
+  if (envOverride && envOverride.trim().length > 0) {
+    return envOverride.trim();
+  }
+  if (details.mode === 'wsl_windows') {
+    return '0.0.0.0';
+  }
+  return '127.0.0.1';
+}
+
+/**
  * Resolve the TCP port the MCP server should use when connecting to the
  * Godot DAP server. Engine binds `127.0.0.1:6006` hardcoded; the editor
  * addon's `McpDapRelay` exposes it on `0.0.0.0:<relay_port>` (default

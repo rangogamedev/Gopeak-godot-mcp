@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, writeSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, writeSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
 import { tmpdir, release } from 'os';
 import { spawn, exec, execFile } from 'child_process';
 import { createConnection as createTcpConnection } from 'node:net';
@@ -39,10 +39,12 @@ import {
   resolveWindowsHostIp,
   resolveDefaultRuntimeHost,
   resolveDefaultRuntimePort,
+  resolveDefaultRuntimeBindHost,
+  normalizePathForCrossPlatformComparison,
 } from './wsl_interop.js';
 import { mapProject } from './gdscript_parser.js';
 import { serveVisualization, setProjectPath, stopVisualizationServer } from './visualizer-server.js';
-import { GodotBridge, getDefaultBridge, BridgeStartupError } from './godot-bridge.js';
+import { GodotBridge, getDefaultBridge, createBridge, findFreePortFrom, BridgeStartupError } from './godot-bridge.js';
 import type { BridgeStartupErrorInfo } from './godot-bridge.js';
 import { getPrompt, listPrompts } from './prompts.js';
 import { buildToolDefinitions as buildToolDefinitionsForServer } from './tool-definitions.js';
@@ -53,6 +55,7 @@ import type {
   GodotProcess,
   GodotEditorProcess,
   GodotServerConfig,
+  GopeakDiscoveryFile,
   MCPToolDefinition,
   OperationParams,
   PreparedGodotCommand,
@@ -61,6 +64,12 @@ import type {
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+
+// Default DAP relay port (per-project ProjectSetting `mcp/editor/dap_relay_port`).
+// Derived per-session by the same offset as the bridge port so concurrent
+// editors get distinct relay ports. Engine DAP (6006) and LSP (6005) remain
+// global editor settings and cannot be isolated per instance — see README.
+const DEFAULT_DAP_RELAY_PORT = 6016;
 
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -89,6 +98,18 @@ class GodotServer {
   private logFlushTimer: NodeJS.Timeout | null = null;
   private readonly logFlushIntervalMs: number = 1500;
   private godotBridge: GodotBridge;
+  // Per-session ports auto-allocated in run(). Runtime + DAP-relay derive from
+  // the bridge-port offset so concurrent worktrees stay unique without a
+  // (WSL-ineffective) Windows-side probe. 0 until run() resolves.
+  private allocatedBridgePort = 0;
+  private allocatedRuntimePort = 0;
+  private allocatedDapRelayPort = 0;
+  // The Godot project this session is bound to (path-gating + discovery file).
+  private primaryProjectPath: string | null = null;
+  private discoveryFileProject: string | null = null;
+  // Last observed editor Play-button state, refreshed via the bridge on
+  // get_editor_status so the agent is aware of a debug game it didn't spawn.
+  private lastKnownPlayState: { is_playing: boolean; played_scene: string; fetchedAt: number } | null = null;
   private shutdownInitiated = false;
   private cachedToolDefinitions: MCPToolDefinition[] = [];
   private toolDefinitionFactory: (() => MCPToolDefinition[]) | null = null;
@@ -112,6 +133,9 @@ class GodotServer {
     'editor.debug_output': 'get_debug_output',
     'editor.status': 'get_editor_status',
     'editor.version': 'get_godot_version',
+    'editor.play': 'play_scene',
+    'editor.stop_play': 'stop_playing_scene',
+    'editor.play_state': 'get_play_state',
     'scene.create': 'create_scene',
     'scene.save': 'save_scene',
     'scene.nodes': 'list_scene_nodes',
@@ -275,6 +299,162 @@ class GodotServer {
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
     this.setupShutdownHandlers();
+  }
+
+  // ============================================
+  // Multi-session port isolation + project discovery
+  // ============================================
+
+  /**
+   * Best-effort detection of the Godot project this session should serve, so a
+   * discovery file can be written (and the bridge gated) before any tool call —
+   * which matters when the user opens the editor manually instead of via
+   * launch_editor. Resolution order: GOPEAK_PROJECT_PATH env → cwd if it holds
+   * a project.godot → first one-level subdirectory that holds one. Returns null
+   * when nothing is found (deferred until a project-scoped tool supplies one).
+   */
+  private detectPrimaryProjectPath(): string | null {
+    const envPath = process.env.GOPEAK_PROJECT_PATH;
+    if (envPath && envPath.trim().length > 0) {
+      return normalize(envPath.trim());
+    }
+    const cwd = process.cwd();
+    if (existsSync(join(cwd, 'project.godot'))) {
+      return cwd;
+    }
+    try {
+      for (const entry of readdirSync(cwd, { withFileTypes: true })) {
+        if (entry.isDirectory() && existsSync(join(cwd, entry.name, 'project.godot'))) {
+          return join(cwd, entry.name);
+        }
+      }
+    } catch {
+      // cwd unreadable — ignore
+    }
+    return null;
+  }
+
+  /**
+   * Bind this session to a Godot project: gate the bridge on it (so a stray
+   * editor can't hijack the connection) and (re)write the per-project discovery
+   * file. The most recent launch/run target wins, so an explicit tool call
+   * overrides the startup cwd guess.
+   */
+  private ensureSessionProject(projectPath: string): void {
+    const norm = normalize(projectPath);
+    if (this.discoveryFileProject && this.discoveryFileProject !== norm) {
+      this.removeDiscoveryFile(this.discoveryFileProject);
+    }
+    this.primaryProjectPath = norm;
+    this.godotBridge.setExpectedProjectPath(norm);
+    this.writeDiscoveryFile(norm);
+  }
+
+  /**
+   * Write `<project>/.gopeak/bridge.json` so the editor/runtime addons in that
+   * project connect to THIS session's auto-allocated ports. Best-effort: a
+   * write failure (read-only project, permissions) is logged and ignored — the
+   * server still works via env/ProjectSetting/default fallbacks.
+   */
+  private writeDiscoveryFile(projectPath: string): void {
+    try {
+      const dir = join(projectPath, '.gopeak');
+      mkdirSync(dir, { recursive: true });
+      const interop = wslGetInteropDetails(process.env.GODOT_PATH ?? this.godotPath ?? null);
+      const status = this.godotBridge.getStatus();
+      const data: GopeakDiscoveryFile = {
+        bridge_host: status.host,
+        bridge_port: status.port,
+        runtime_port: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
+        runtime_bind_host: resolveDefaultRuntimeBindHost(interop),
+        dap_relay_port: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
+        pid: process.pid,
+        version: SERVER_VERSION,
+        startedAt: new Date().toISOString(),
+      };
+      writeFileSync(join(dir, 'bridge.json'), JSON.stringify(data, null, 2));
+      this.discoveryFileProject = projectPath;
+      this.maybeHintGitignore(projectPath);
+    } catch (err) {
+      console.error(`[SERVER] Discovery file write skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private removeDiscoveryFile(projectPath: string | null): void {
+    if (!projectPath) {
+      return;
+    }
+    try {
+      unlinkSync(join(projectPath, '.gopeak', 'bridge.json'));
+    } catch {
+      // already gone / never written — ignore
+    }
+    if (this.discoveryFileProject === projectPath) {
+      this.discoveryFileProject = null;
+    }
+  }
+
+  /** One-time stderr nudge to gitignore the per-session discovery file. */
+  private maybeHintGitignore(projectPath: string): void {
+    try {
+      const gitignore = join(projectPath, '.gitignore');
+      if (!existsSync(gitignore)) {
+        return;
+      }
+      const content = readFileSync(gitignore, 'utf8');
+      if (!/^\.gopeak\/?\s*$/m.test(content)) {
+        console.error(`[SERVER] Hint: add '.gopeak/' to ${gitignore} (per-session discovery file; do not commit).`);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Environment for spawned Godot editor/game processes. Carries this session's
+   * ports so the runtime autoload binds the right one and the editor's
+   * Play-button child game (which inherits the editor env) is reachable from
+   * WSL. The discovery file is the primary channel; these are belt-and-braces
+   * for the gopeak-launched path.
+   */
+  private buildGodotSpawnEnv(): NodeJS.ProcessEnv {
+    const interop = wslGetInteropDetails(process.env.GODOT_PATH ?? this.godotPath ?? null);
+    return {
+      ...process.env,
+      GOPEAK_BRIDGE_PORT: String(this.allocatedBridgePort || this.godotBridge.getStatus().port),
+      GOPEAK_RUNTIME_PORT: String(this.allocatedRuntimePort || resolveDefaultRuntimePort()),
+      GOPEAK_RUNTIME_BIND_HOST: resolveDefaultRuntimeBindHost(interop),
+    };
+  }
+
+  /**
+   * Start the bridge, reallocating to a higher port if the chosen one turns out
+   * to be taken between the free-port probe and the bind (EADDRINUSE) or held by
+   * a healthy peer's lockfile (OTHER) — the multi-session race. Re-applies the
+   * project gate after each reconstruction.
+   */
+  private async startBridgeWithRetry(host: string, maxRetries = 4): Promise<void> {
+    let attempt = 0;
+    for (;;) {
+      try {
+        await this.godotBridge.start();
+        return;
+      } catch (err) {
+        const portClash = err instanceof BridgeStartupError
+          && (err.info.code === 'EADDRINUSE' || err.info.code === 'OTHER');
+        if (!portClash || attempt >= maxRetries) {
+          throw err;
+        }
+        attempt += 1;
+        const busyPort = this.godotBridge.getStatus().port;
+        const freePort = await findFreePortFrom(busyPort + 1, host);
+        console.error(`[SERVER] Bridge port ${busyPort} unavailable (${err.info.code}); retrying on ${freePort}.`);
+        this.godotBridge = createBridge(freePort, undefined, host);
+        if (this.primaryProjectPath) {
+          this.godotBridge.setExpectedProjectPath(this.primaryProjectPath);
+        }
+      }
+    }
   }
 
   /**
@@ -673,6 +853,7 @@ class GodotServer {
       this.dapClient = null;
     }
     stopVisualizationServer();
+    this.removeDiscoveryFile(this.discoveryFileProject);
     if (this.godotBridge) {
       try { await this.godotBridge.stop(); } catch {}
     }
@@ -769,6 +950,8 @@ class GodotServer {
       this.activeProcess = null;
     }
 
+    this.removeDiscoveryFile(this.discoveryFileProject);
+
     if (this.godotBridge) {
       void this.godotBridge.stop().catch(() => {});
     }
@@ -779,7 +962,10 @@ class GodotServer {
     args: unknown,
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
-    const RUNTIME_PORT = resolveDefaultRuntimePort();
+    // Target THIS session's allocated runtime port (falls back to the env/default
+    // before run() finishes wiring it), not the shared default — otherwise two
+    // sessions would both probe 7777 and only one game would be reachable.
+    const RUNTIME_PORT = this.allocatedRuntimePort || resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const timeoutOverride = Number.parseInt(process.env.GOPEAK_RUNTIME_TIMEOUT_MS || '', 10);
     const TIMEOUT_MS = Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000;
@@ -1677,9 +1863,49 @@ class GodotServer {
       editor_pid: editorPid,
       launched_at: launchedAt,
       tracked_project_path,
+      // Multi-session: the project this server is bound to + its allocated
+      // ports, so an agent can confirm two worktrees got distinct ports.
+      session_project_path: this.primaryProjectPath,
+      allocated_ports: {
+        bridge: this.allocatedBridgePort || status.port,
+        runtime: this.allocatedRuntimePort || null,
+        dap_relay: this.allocatedDapRelayPort || null,
+      },
+      // In-editor Play-button game state (refreshed via the bridge in the
+      // get_editor_status dispatch). Null when the bridge isn't connected —
+      // query get_play_state for a live read. Distinct from `active_process`
+      // semantics: editor_play_state is stopped with stop_playing_scene; an
+      // MCP-spawned run_project game is stopped with stop_project.
+      editor_play_state: this.lastKnownPlayState,
       note: conflictNote,
       suggestion: conflictSuggestion,
     };
+  }
+
+  /**
+   * Refresh the cached editor Play-button state via the bridge. Best-effort:
+   * keeps the existing cache on error so get_editor_status never fails because
+   * of a play-state probe. No-op when the bridge isn't connected.
+   */
+  private async refreshPlayState(): Promise<void> {
+    if (!this.godotBridge.isConnected()) {
+      return;
+    }
+    try {
+      const result = await this.godotBridge.invokeTool('get_play_state', {}) as
+        { is_playing?: unknown; played_scene?: unknown } | null;
+      if (result && typeof result === 'object') {
+        this.lastKnownPlayState = {
+          is_playing: Boolean((result as { is_playing?: unknown }).is_playing),
+          played_scene: typeof (result as { played_scene?: unknown }).played_scene === 'string'
+            ? (result as { played_scene: string }).played_scene
+            : '',
+          fetchedAt: Date.now(),
+        };
+      }
+    } catch {
+      // leave the previous cache in place
+    }
   }
 
   /**
@@ -1850,6 +2076,12 @@ class GodotServer {
           return await this.handleRestartEditor(request.params.arguments);
         case 'get_fs_scanning_status':
           return await this.handleViaBridge('get_fs_scanning_status', request.params.arguments);
+        case 'get_play_state':
+          return await this.handleViaBridge('get_play_state', request.params.arguments);
+        case 'play_scene':
+          return await this.handleViaBridge('play_scene', request.params.arguments);
+        case 'stop_playing_scene':
+          return await this.handleViaBridge('stop_playing_scene', request.params.arguments);
         case 'get_godot_version':
           return await this.handleGetGodotVersion();
         case 'list_projects':
@@ -2050,6 +2282,7 @@ class GodotServer {
           return await this.handleViaBridge('modify_resource', normalizedArgs);
         // Editor Plugin Bridge Status
         case 'get_editor_status':
+          await this.refreshPlayState();
           return { content: [{ type: 'text', text: JSON.stringify(this.getEditorStatusPayload(), null, 2) }] };
         // Project Visualizer Tool
         case 'map_project':
@@ -2137,11 +2370,16 @@ class GodotServer {
         );
       }
 
+      // Bind this session to the project before spawning so the discovery file
+      // and bridge gate are in place when the editor's addon connects.
+      this.ensureSessionProject(args.projectPath);
+
       const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
       this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
       const editorChild = spawn(prepared.command, prepared.args, {
         stdio: 'pipe',
         cwd: prepared.cwd,
+        env: this.buildGodotSpawnEnv(),
       });
 
       editorChild.on('error', (err: Error) => {
@@ -2160,6 +2398,9 @@ class GodotServer {
         process: editorChild,
         projectPath: prepared.targetProjectPath,
         launchedAt: Date.now(),
+        bridgePort: this.allocatedBridgePort || this.godotBridge.getStatus().port,
+        runtimePort: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
+        dapRelayPort: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
       };
 
       return {
@@ -2244,9 +2485,13 @@ class GodotServer {
         suffixArgs.push(args.scene);
       }
 
+      // Bind this session to the project so the runtime autoload (which
+      // inherits this env) binds the right port and the discovery file exists.
+      this.ensureSessionProject(args.projectPath);
+
       const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-d'], suffixArgs);
       this.logDebug(`Running Godot project: ${prepared.projectPathForDisplay}`);
-      const process = spawn(prepared.command, prepared.args, { stdio: 'pipe', cwd: prepared.cwd });
+      const process = spawn(prepared.command, prepared.args, { stdio: 'pipe', cwd: prepared.cwd, env: this.buildGodotSpawnEnv() });
       const output: string[] = [];
       const errors: string[] = [];
 
@@ -7145,18 +7390,54 @@ class GodotServer {
       // without awaiting the Godot-path probe. Bridge start is fast
       // (localhost WebSocket) and its failure is non-fatal.
 
+      // --- Multi-session port isolation --------------------------------
+      // Auto-allocate a free bridge port so concurrent worktrees don't fight
+      // over the default. The bridge binds on the gopeak (WSL) side, so a
+      // localhost free-port probe is accurate here. Runtime + DAP-relay ports
+      // derive from the resulting offset (computed post-start) — a Windows-side
+      // probe would be meaningless from WSL, and inheriting the offset keeps
+      // them unique per session. Offset 0 (single session) preserves the
+      // historical 6505/7777/6016 defaults byte-for-byte.
+      const bridgeBasePort = this.godotBridge.getStatus().port;
+      const bridgeHost = this.godotBridge.getStatus().host;
+      try {
+        const freePort = await findFreePortFrom(bridgeBasePort, bridgeHost);
+        if (freePort !== bridgeBasePort) {
+          this.godotBridge = createBridge(freePort, undefined, bridgeHost);
+          console.error(`[SERVER] Bridge port ${bridgeBasePort} busy; selected ${freePort} for this session.`);
+        }
+      } catch (allocErr) {
+        console.error(`[SERVER] Bridge port auto-allocation failed (${allocErr instanceof Error ? allocErr.message : String(allocErr)}); using base ${bridgeBasePort}.`);
+      }
+
+      // Bind the bridge to this session's project (path-gating) so a stray
+      // editor that fell back to the default port can't hijack it.
+      this.primaryProjectPath = this.detectPrimaryProjectPath();
+      if (this.primaryProjectPath) {
+        this.godotBridge.setExpectedProjectPath(this.primaryProjectPath);
+      }
+
       // Start the Godot Editor Bridge (WebSocket server for editor plugin).
       // Bridge startup issues should not take down the stdio MCP server.
       try {
-        await this.godotBridge.start();
+        await this.startBridgeWithRetry(bridgeHost);
         this.bridgeStartupError = null;
         this.bridgeStartupErrorInfo = null;
         const bridgeStatus = this.godotBridge.getStatus();
+        this.allocatedBridgePort = bridgeStatus.port;
+        const portOffset = this.allocatedBridgePort - bridgeBasePort;
+        this.allocatedRuntimePort = Math.min(65535, resolveDefaultRuntimePort() + portOffset);
+        this.allocatedDapRelayPort = Math.min(65535, DEFAULT_DAP_RELAY_PORT + portOffset);
         const selfTest = bridgeStatus.bridgeSelfTest;
         const selfTestNote = selfTest === null
           ? ''
           : ` (self-test ${selfTest.pass ? `OK in ${selfTest.durationMs}ms` : `FAILED: ${selfTest.error ?? 'unknown'}`})`;
-        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port}${selfTestNote}`);
+        console.error(`[SERVER] Godot Editor Bridge started on ${bridgeStatus.host}:${bridgeStatus.port} (runtime ${this.allocatedRuntimePort}, dap-relay ${this.allocatedDapRelayPort})${selfTestNote}`);
+        // Now that ports are final, publish the discovery file for the project
+        // (if known) so a manually-opened editor connects to the right ports.
+        if (this.primaryProjectPath) {
+          this.writeDiscoveryFile(this.primaryProjectPath);
+        }
       } catch (bridgeError) {
         const bridgeMessage = bridgeError instanceof Error ? bridgeError.message : String(bridgeError);
         this.bridgeStartupError = bridgeMessage;

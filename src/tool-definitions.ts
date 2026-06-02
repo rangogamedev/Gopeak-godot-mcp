@@ -96,6 +96,32 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
           },
         },
         {
+          name: 'get_play_state',
+          description: 'Query whether the Godot editor is currently running a game via the Play button (or play_scene). Returns { ok: true, is_playing: bool, played_scene: string }. This is the IN-EDITOR debug session — distinct from a process started by run_project (that one shows under get_editor_status.active/stop with stop_project). Use before play_scene/stop_playing_scene, or to detect a debug game a human started that the agent should be aware of.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'play_scene',
+          description: 'Start a game in the Godot editor, equivalent to pressing Play. With no scene_path, plays the project main scene; if scene_path matches the open scene, plays the current scene; otherwise plays that specific scene. This drives the IN-EDITOR debug runner (reachable by runtime introspection on this session\'s allocated runtime port). Distinct from run_project, which spawns a separate Godot process. Stop it with stop_playing_scene.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              scene_path: { type: 'string', description: 'Optional res:// path of the scene to play. Omit to play the project main scene.' },
+            },
+          },
+        },
+        {
+          name: 'stop_playing_scene',
+          description: 'Stop the in-editor debug game (equivalent to the editor Stop button). Returns { ok: true, was_playing: bool }; no-op when nothing is playing. IMPORTANT: this only stops a game started via the editor Play button or play_scene. To stop a process started by run_project, use stop_project instead.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
           name: 'get_godot_version',
           description: 'Returns the installed Godot engine version string. Use to check compatibility (e.g., Godot 4.4+ features like UID). Returns version like "4.3.stable" or "4.4.dev".',
           inputSchema: {

@@ -8,6 +8,7 @@ import { join as joinPath } from 'node:path';
 import { execSync } from 'node:child_process';
 import type { RawData } from 'ws';
 import { WebSocket, WebSocketServer } from 'ws';
+import { normalizePathForCrossPlatformComparison } from './wsl_interop.js';
 
 const DEFAULT_PORT = 6505;
 const DEFAULT_HOST = process.platform === 'linux' && release().toLowerCase().includes('microsoft') ? '0.0.0.0' : '127.0.0.1';
@@ -18,6 +19,11 @@ const KEEPALIVE_INTERVAL_MS = 10_000;
 // advanced while no tool is in flight (see startKeepalive), so a long
 // synchronous editor tool that blocks Godot's main thread can't trip it.
 const PONG_MISS_LIMIT = 3;
+// WebSocket close code used when a connecting editor's project_path does not
+// match the project this bridge instance is bound to (multi-session isolation).
+// 4001 is in the application-private range (4000-4999); 4000 was the legacy
+// "already connected" reject code, retired by last-writer-wins takeover.
+const PROJECT_MISMATCH_CLOSE_CODE = 4001;
 const BRIDGE_PORT_ENV_KEYS = ['GODOT_BRIDGE_PORT', 'MCP_BRIDGE_PORT', 'GOPEAK_BRIDGE_PORT'] as const;
 const BRIDGE_HOST_ENV_KEYS = ['GODOT_BRIDGE_HOST', 'MCP_BRIDGE_HOST', 'GOPEAK_BRIDGE_HOST'] as const;
 const BRIDGE_VERSION = (() => {
@@ -281,6 +287,43 @@ async function waitForPortFree(host: string, port: number, timeoutMs = 1500): Pr
 }
 
 /**
+ * Find the first bindable TCP port at or above `base`, probing up to
+ * `maxAttempts` consecutive ports. Used for per-session auto-allocation so two
+ * gopeak instances (e.g. two git worktrees) don't fight over the default port.
+ *
+ * Each candidate is verified with an actual `server.listen()` (the only
+ * race-free "is it free" check in Node) and released immediately. There is a
+ * sub-millisecond window between release and the caller's real bind where a
+ * sibling could grab the same port — callers that bind must still handle
+ * EADDRINUSE and retry with `base = chosen + 1`.
+ *
+ * `0.0.0.0`/`::` are probed on `127.0.0.1` (a successful loopback bind implies
+ * the wildcard bind will also succeed), mirroring `waitForPortFree`.
+ */
+export async function findFreePortFrom(base: number, host: string, maxAttempts = 20): Promise<number> {
+  const probeHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
+  for (let offset = 0; offset < maxAttempts; offset += 1) {
+    const candidate = base + offset;
+    if (candidate > 65535) {
+      break;
+    }
+    const free = await new Promise<boolean>((resolve) => {
+      const probe = http.createServer();
+      probe.once('error', () => {
+        resolve(false);
+      });
+      probe.listen(candidate, probeHost, () => {
+        probe.close(() => resolve(true));
+      });
+    });
+    if (free) {
+      return candidate;
+    }
+  }
+  throw new Error(`No free port found in range ${base}-${base + maxAttempts - 1} on ${host}`);
+}
+
+/**
  * Send SIGTERM, wait up to `timeoutMs` for the process to exit, then SIGKILL.
  * Resolves to true if the process is gone by the end, false otherwise.
  */
@@ -507,6 +550,10 @@ export class GodotBridge extends EventEmitter {
   private startupErrorInfo: BridgeStartupErrorInfo | null = null;
   private reclaimedPidsAtStartup: number[] = [];
   private pidFileOwned = false;
+  // When set, this bridge only accepts a Godot editor whose `godot_ready`
+  // project_path matches (multi-session isolation). Null = accept any editor
+  // (legacy / single-session behaviour). See setExpectedProjectPath.
+  private expectedProjectPath: string | null = null;
 
   public constructor(
     private readonly port: number = DEFAULT_PORT,
@@ -778,6 +825,35 @@ export class GodotBridge extends EventEmitter {
     return this.socket?.readyState === WebSocket.OPEN;
   }
 
+  /**
+   * Bind this bridge to a specific Godot project (multi-session isolation).
+   * Once set, an inbound editor must announce a matching `project_path` in its
+   * `godot_ready` handshake before it can take over the active socket; a
+   * mismatched editor (e.g. one that fell back to the default port before its
+   * discovery file existed) is rejected instead of hijacking this session.
+   * Passing `null` restores the legacy accept-any behaviour.
+   */
+  public setExpectedProjectPath(projectPath: string | null): void {
+    this.expectedProjectPath = projectPath && projectPath.trim().length > 0 ? projectPath : null;
+  }
+
+  public getExpectedProjectPath(): string | null {
+    return this.expectedProjectPath;
+  }
+
+  /**
+   * Compare an incoming editor project_path against this bridge's expected
+   * project, tolerant of WSL↔Windows path-form differences (the editor reports
+   * `C:/...` while gopeak holds `/mnt/c/...`) and trailing slashes.
+   */
+  private projectPathMatches(incoming: string): boolean {
+    if (this.expectedProjectPath === null) {
+      return true;
+    }
+    const norm = (p: string) => normalizePathForCrossPlatformComparison(p).replace(/\/+$/, '');
+    return norm(incoming) === norm(this.expectedProjectPath);
+  }
+
   public getStatus(): BridgeStatus {
     return {
       host: this.host,
@@ -952,6 +1028,75 @@ export class GodotBridge extends EventEmitter {
   }
 
   private handleConnection(nextSocket: WebSocket): void {
+    // Multi-session isolation: when this bridge is bound to a project, hold the
+    // new socket in probation until its godot_ready proves it belongs to this
+    // project. This MUST happen before any takeover so a stray editor cannot
+    // evict the legitimate one via last-writer-wins. Unset → legacy accept-any.
+    if (this.expectedProjectPath !== null) {
+      this.handleGatedConnection(nextSocket);
+      return;
+    }
+    this.adoptConnection(nextSocket);
+  }
+
+  /**
+   * Probationary handshake for an isolated bridge. The connecting editor sends
+   * `godot_ready { project_path }` first (mcp_client.gd does this immediately on
+   * open). We adopt it only if the project matches; otherwise we close it with
+   * PROJECT_MISMATCH_CLOSE_CODE and leave the current socket untouched. If
+   * godot_ready never arrives the socket sits idle and is cleaned up on close —
+   * the active socket (if any) is never disturbed.
+   */
+  private handleGatedConnection(nextSocket: WebSocket): void {
+    const onProbeMessage = (data: RawData) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== 'object') {
+        return;
+      }
+      const message = parsed as Record<string, unknown>;
+      if (message.type !== 'godot_ready' || typeof message.project_path !== 'string') {
+        // Editor always sends godot_ready first; ignore anything else during
+        // probation rather than guessing.
+        return;
+      }
+
+      nextSocket.off('message', onProbeMessage);
+      nextSocket.off('close', onProbeClose);
+
+      const projectPath = message.project_path;
+      if (this.projectPathMatches(projectPath)) {
+        this.log('info', `Accepting Godot connection for matching project: ${projectPath}`);
+        this.adoptConnection(nextSocket);
+        // Re-dispatch the consumed godot_ready so connectionInfo.projectPath is
+        // set and the godot_connected event carries the path.
+        this.handleMessage({ type: 'godot_ready', project_path: projectPath });
+      } else {
+        this.log(
+          'warn',
+          `Rejecting Godot connection: project '${projectPath}' does not match this session's project '${this.expectedProjectPath}'`,
+        );
+        try {
+          nextSocket.close(PROJECT_MISMATCH_CLOSE_CODE, 'project mismatch');
+        } catch {
+          // best effort
+        }
+      }
+    };
+
+    const onProbeClose = () => {
+      nextSocket.off('message', onProbeMessage);
+    };
+
+    nextSocket.on('message', onProbeMessage);
+    nextSocket.once('close', onProbeClose);
+  }
+
+  private adoptConnection(nextSocket: WebSocket): void {
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
       // Last-writer-wins. The editor client is a singleton, so a fresh inbound
       // connection is authoritative — the existing socket is either being

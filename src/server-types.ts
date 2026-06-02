@@ -11,6 +11,27 @@ export interface GodotEditorProcess {
   process: ChildProcess;
   projectPath: string;
   launchedAt: number;
+  bridgePort: number;
+  runtimePort: number;
+  dapRelayPort: number;
+}
+
+/**
+ * Per-project discovery file (`<project>/.gopeak/bridge.json`) written by the
+ * gopeak server so the Godot editor/runtime addons in that project can find
+ * THIS session's auto-allocated ports instead of the shared defaults. Read by
+ * mcp_client.gd (bridge) and mcp_runtime_autoload.gd (runtime). Per-machine /
+ * per-session — must be gitignored.
+ */
+export interface GopeakDiscoveryFile {
+  bridge_host: string;
+  bridge_port: number;
+  runtime_port: number;
+  runtime_bind_host: string;
+  dap_relay_port: number;
+  pid: number;
+  version: string;
+  startedAt: string;
 }
 
 export interface WSLInteropDetails {
