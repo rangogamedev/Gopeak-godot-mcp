@@ -373,23 +373,48 @@ Visualize your entire project architecture with `visualizer.map` (`map_project` 
 | `DEBUG` | Enable server debug logs (`true`/`false`) | `false` |
 | `LOG_MODE` | Recording mode: `lite` or `full` | `lite` |
 | `GOPEAK_TOOLS_PAGE_SIZE` | Number of tools per `tools/list` page (pagination) | `33` |
-| `GOPEAK_BRIDGE_PORT` | Port for unified bridge/visualizer server | `6505` |
+| `GOPEAK_BRIDGE_PORT` | Base bridge/visualizer port. Treated as a *base hint*: if busy, the server auto-allocates the next free port (multi-session) | `6505` |
 | `GOPEAK_BRIDGE_HOST` | Bind host for bridge/visualizer server | `127.0.0.1` |
+| `GOPEAK_PROJECT_PATH` | Pin the project this session serves (path-gating + discovery file). Auto-detected from cwd / launch args when unset | auto-detect |
+| `GOPEAK_RUNTIME_PORT` | Base runtime-addon command-socket port (derives per session from the bridge offset) | `7777` |
+| `GOPEAK_RUNTIME_BIND_HOST` | Bind host for the in-game runtime control socket. Loopback by default; `0.0.0.0` auto-selected in WSL→Windows mode so a WSL server can reach a Windows game | `127.0.0.1` |
 
 ### Ports
 
 | Port | Service |
 |---|---|
-| `6505` (default) | Unified Godot Bridge + Visualizer server (+ `/health`, `/mcp`) on loopback by default |
-| `6005` | Godot LSP |
-| `6006` | Godot DAP |
-| `7777` | Runtime addon command socket (only needed for runtime tools) |
+| `6505` (base) | Unified Godot Bridge + Visualizer server (+ `/health`, `/mcp`). Auto-allocated upward when busy |
+| `6005` | Godot LSP (global editor setting — see multi-session note) |
+| `6006` | Godot DAP (global editor setting — see multi-session note) |
+| `7777` (base) | Runtime addon command socket (only needed for runtime tools). Per-session, derived from the bridge offset |
 
 ### Minimal port profiles
 
 - **Core editing only**: bridge port (`GODOT_BRIDGE_PORT`, default `6505`)
 - **Core + runtime actions (screenshots/input/runtime inspect)**: bridge port + `7777`
 - **Full debugging + diagnostics**: bridge port + `6005` + `6006` + `7777`
+
+### Multi-session / parallel worktrees
+
+Multiple Claude/agent sessions can each drive their own Godot editor at the same time (e.g. testing
+different game stages across git worktrees). Each gopeak instance:
+
+- **Auto-allocates free ports** on startup — `GOPEAK_BRIDGE_PORT`/`GOPEAK_RUNTIME_PORT` are *base
+  hints*; if the base is busy the next free port is chosen. The runtime + DAP-relay ports derive
+  from the bridge offset, so a single session with free defaults still uses `6505`/`7777`/`6016`.
+- **Writes a discovery file** `<project>/.gopeak/bridge.json` that the editor and runtime addons read
+  to find this session's ports — zero manual config. **Add `.gopeak/` to your project's
+  `.gitignore`** (it is per-machine/per-session). Resolution precedence in the addon:
+  discovery file → env (`GOPEAK_BRIDGE_PORT`) → Project Settings → default. The discovery file
+  outranks env because the env value is shared across all sessions.
+- **Gates the bridge on the project path** — an editor whose `godot_ready` project doesn't match the
+  one this session owns is rejected, so a stray editor can never hijack another session's connection.
+
+**LSP (`6005`) and raw DAP (`6006`) are global Godot editor settings** with no per-instance override,
+so when several editors run at once only the first to bind owns them; gopeak reports them as
+unavailable rather than hanging. The DAP *relay* port (`6016` base, per-project) is isolated per
+session. The core path — scene editing, run/stop/play/close game, runtime introspection, debug
+output — is fully isolated per worktree.
 
 ---
 
@@ -400,7 +425,8 @@ Visualize your entire project architecture with `visualizer.map` (`map_project` 
 - **Project path invalid** → confirm `project.godot` exists
 - **Runtime tools not working** → install/enable runtime addon plugin
 - **Need a tool that is not visible** → run `tool.catalog` to search and auto-activate matching groups, or use `tool.groups` to activate a specific group
-- **`get_editor_status` says disconnected while the Godot editor shows connected** → check whether another `gopeak`/MCP server instance already owns bridge port `6505`; the status payload now reports the startup error and suggests stopping duplicate servers
+- **`get_editor_status` says disconnected while the Godot editor shows connected** → the editor is connected to a *different* session's bridge. `get_editor_status` reports this session's `port` and `session_project_path`; confirm the editor's project matches and that `<project>/.gopeak/bridge.json` exists (multiple instances each auto-allocate their own port, so the editor must read the discovery file to find the right one). Reopen/reload the editor plugin to re-resolve.
+- **Running a debug game and want to stop it / know if one is running** → `get_play_state` reports the in-editor Play-button game; `stop_playing_scene` stops it; `play_scene` starts it. `get_editor_status.editor_play_state` surfaces a game a human started. (These are distinct from `run_project`/`stop_project`, which manage a separate gopeak-spawned process.)
 - **(WSL) MCP server times out / needs `/mcp` reconnect on almost every fresh session** → you are launching the server from a `/mnt/c` (9p) path, whose slow `node_modules` load exceeds Claude Code's 30s `initialize` timeout. Run it from the native Linux filesystem instead — see [Installation → D) WSL](#d-wsl-windows-subsystem-for-linux--run-from-the-native-linux-filesystem)
 
 ---

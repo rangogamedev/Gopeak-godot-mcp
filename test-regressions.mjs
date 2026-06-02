@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { createBridge } from './build/godot-bridge.js';
+import { createBridge, findFreePortFrom } from './build/godot-bridge.js';
 import {
   getWSLInteropDetails,
   convertMountedPathToWindows,
@@ -20,6 +20,7 @@ import {
   resolveDefaultRuntimeHost,
   resolveDefaultDAPPort,
   resolveDefaultRuntimePort,
+  resolveDefaultRuntimeBindHost,
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
@@ -32,6 +33,8 @@ const TOOL_DEFS_SOURCE = readFileSync(new URL('./src/tool-definitions.ts', impor
 const TOOL_GROUPS_SOURCE = readFileSync(new URL('./src/tool-groups.ts', import.meta.url), 'utf8');
 const TOOL_EXECUTOR_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/tool_executor.gd', import.meta.url), 'utf8');
 const MCP_CLIENT_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/mcp_client.gd', import.meta.url), 'utf8');
+const PLUGIN_SOURCE = readFileSync(new URL('./src/addon/godot_mcp_editor/plugin.gd', import.meta.url), 'utf8');
+const WSL_INTEROP_SOURCE = readFileSync(new URL('./src/wsl_interop.ts', import.meta.url), 'utf8');
 
 function makeRequest(method, params, id) {
   return JSON.stringify({ jsonrpc: '2.0', method, params, id }) + '\n';
@@ -267,7 +270,11 @@ function testSceneToolsVectorRegression() {
   }
 }
 
-async function testEditorStatusPortConflict() {
+// Multi-session: an occupied default bridge port must NOT wedge the server.
+// gopeak auto-allocates the next free port and comes up available. (This
+// replaced the old testEditorStatusPortConflict, which asserted the pre-
+// auto-allocation behaviour where a busy port left the bridge unavailable.)
+async function testBridgePortAutoAllocation() {
   await withOccupiedBridgePort(async () => {
     const proc = spawn(process.execPath, ['./build/index.js'], {
       cwd: process.cwd(),
@@ -296,30 +303,18 @@ async function testEditorStatusPortConflict() {
       proc.stdin.write(makeRequest('tools/call', { name: 'get_editor_status', arguments: {} }, 2));
       const response = await waitForJsonLine(proc.stdout, (msg) => msg.id === 2);
       const payload = JSON.parse(response.result.content[0].text);
-      assert.equal(payload.bridgeAvailable, false);
-      // Two valid failure paths to the same outcome (bridge cannot bind):
-      //   EADDRINUSE — non-gopeak holder (blocker succeeded in binding 6505).
-      //   OTHER      — gopeak holder (lockfile preflight detected a healthy
-      //                peer, e.g. when the dev machine has another live
-      //                Claude Code session). Surfaces the holder PID + parent
-      //                via the "Another gopeak instance is healthy" message.
-      assert.ok(payload.startupErrorInfo, 'startupErrorInfo block must be populated on bridge bind failure');
+      // The occupied 6505 forces auto-allocation: the bridge binds a different
+      // free port and reports itself available with no startup error.
+      assert.equal(payload.bridgeAvailable, true, 'bridge should auto-allocate a free port when the default is occupied');
+      assert.equal(payload.startupError, null, 'no startup error after successful auto-allocation');
+      assert.notEqual(payload.port, 6505, 'bridge should have moved off the occupied default port 6505');
       assert.ok(
-        payload.startupErrorInfo.code === 'EADDRINUSE' || payload.startupErrorInfo.code === 'OTHER',
-        `startupErrorInfo.code should be EADDRINUSE or OTHER, got ${payload.startupErrorInfo.code}`,
+        Number.isInteger(payload.port) && payload.port > 6505 && payload.port <= 65535,
+        `bridge port should be a valid reallocated port above 6505, got ${payload.port}`,
       );
-      if (payload.startupErrorInfo.code === 'EADDRINUSE') {
-        assert.match(payload.startupError ?? '', /EADDRINUSE/i);
-        assert.match(payload.note ?? '', /Bridge port is already in use/i);
-      } else {
-        assert.match(payload.startupError ?? '', /Another gopeak instance is healthy/i);
-      }
-      // findPortHolder may legitimately fail to identify the holder when lsof/ss
-      // are absent (rare on Linux/WSL but possible in minimal containers); accept
-      // either a numeric PID or null.
       assert.ok(
-        payload.holderPid === null || typeof payload.holderPid === 'number',
-        'holderPid is number or null'
+        payload.allocated_ports && payload.allocated_ports.bridge === payload.port,
+        'allocated_ports.bridge should match the live bridge port',
       );
     } finally {
       proc.kill('SIGTERM');
@@ -504,16 +499,21 @@ async function testStdinEofShutdown() {
 }
 
 /**
- * Fix A.2 — PID lockfile healthy handoff. Spawn gopeak A with healthy parent
- * (this test process), then spawn gopeak B. B must detect A via the lockfile,
- * recognize A's parent is alive, and exit cleanly with the "use the existing
- * instance" diagnostic instead of fighting for :6505.
+ * Multi-session coexistence (replaces the old "healthy handoff refuses"
+ * behaviour). Spawn gopeak A on a port, then spawn gopeak B pointed at the SAME
+ * base port. Instead of refusing, B must auto-allocate the next free port and
+ * come up with its OWN healthy bridge — two sessions, two distinct ports, both
+ * available. This is the core property that lets two worktrees drive Godot at
+ * once. A must remain healthy and keep its original port throughout.
  */
-async function testPidLockfileHealthyHandoff() {
+async function testTwoInstancesCoexistOnDistinctPorts() {
   const sharedPort = String(allocateTestBridgePort());
-  const { proc: procA } = await spawnGopeakAndGetStatus({ GOPEAK_BRIDGE_PORT: sharedPort });
+  const { proc: procA, payload: payloadA } = await spawnGopeakAndGetStatus({ GOPEAK_BRIDGE_PORT: sharedPort });
   try {
-    // B must point at the SAME port to encounter A's lockfile + holder.
+    assert.equal(payloadA.bridgeAvailable, true, 'A should bind its bridge');
+    assert.equal(payloadA.port, Number(sharedPort), 'A should own the base port');
+
+    // B points at the SAME base port and must coexist on a different one.
     const procB = spawn(process.execPath, ['./build/index.js'], {
       cwd: process.cwd(),
       env: { ...process.env, GOPEAK_TOOL_PROFILE: 'compact', GOPEAK_BRIDGE_PORT: sharedPort },
@@ -525,8 +525,6 @@ async function testPidLockfileHealthyHandoff() {
     try {
       await delay(1500);
 
-      // B should still be alive (gopeak keeps the stdio MCP server up even
-      // when bridge fails) — but its editor-status must report startupError.
       procB.stdin.write(makeRequest('initialize', {
         protocolVersion: '2024-11-05',
         capabilities: {},
@@ -539,21 +537,16 @@ async function testPidLockfileHealthyHandoff() {
       const response = await waitForJsonLine(procB.stdout, (msg) => msg.id === 2);
       const payload = JSON.parse(response.result.content[0].text);
 
-      // B must NOT have reclaimed A (A's parent — this test process — is alive).
-      // Two valid outcomes:
-      //   OTHER     — B read A's lockfile, saw it healthy, exited preflight.
-      //                This is the intended "healthy handoff" path.
-      //   EADDRINUSE — B raced past the lockfile read (rare with the polling
-      //                helper, but possible under heavy load) and got rejected
-      //                at bind. Still surfaces holderPid for diagnostic.
-      // Log which path was hit so a regression that always falls into the
-      // EADDRINUSE branch (lockfile preflight broken) is visible in CI.
-      console.log(`  testPidLockfileHealthyHandoff: B took path ${payload.startupErrorInfo?.code}`);
-      assert.equal(payload.bridgeAvailable, false, 'B must not own the bridge while A is healthy');
+      console.log(`  coexistence: A on ${payloadA.port}, B on ${payload.port}`);
+      assert.equal(payload.bridgeAvailable, true, 'B should auto-allocate its own bridge alongside A');
+      assert.equal(payload.startupError, null, 'B should have no startup error');
+      assert.notEqual(payload.port, Number(sharedPort), 'B must not share A\'s port');
       assert.ok(
-        payload.startupErrorInfo?.code === 'OTHER' || payload.startupErrorInfo?.code === 'EADDRINUSE',
-        'B startupErrorInfo.code should be OTHER (lockfile) or EADDRINUSE (race-loser)',
+        Number.isInteger(payload.port) && payload.port > Number(sharedPort) && payload.port <= 65535,
+        `B should bind a distinct higher port, got ${payload.port}`,
       );
+      // A must be untouched (not reclaimed/evicted by B coming up).
+      assert.equal(procA.exitCode, null, 'A must stay alive while B coexists');
     } finally {
       await killAndWait(procB);
     }
@@ -1228,10 +1221,11 @@ function testEditorLifecycleTracking() {
     'HITL: close_editor schema must document i_understand_data_loss_risk',
   );
 
-  // Tool group updated.
+  // Tool group updated. (play/stop debug-game tools were inserted between
+  // restart_editor and get_fs_scanning_status — allow them between.)
   assert.match(
     TOOL_GROUPS_SOURCE,
-    /'close_editor',\s*'restart_editor',\s*'get_fs_scanning_status'/,
+    /'close_editor',\s*'restart_editor',[\s\S]*'get_fs_scanning_status'/,
     'core_editor group should include close_editor + restart_editor + get_fs_scanning_status',
   );
 
@@ -1302,6 +1296,203 @@ function testEditorLifecycleTracking() {
   );
 }
 
+// ============================================
+// Multi-session isolation + close-debug-game tests
+// ============================================
+
+// findFreePortFrom must skip occupied ports and return the next free one, so
+// two concurrent sessions never bind the same bridge port.
+async function testPortAllocationNonCollision() {
+  const base = allocateTestBridgePort();
+  const blocker1 = createServer();
+  await new Promise((resolve) => blocker1.listen(base, '127.0.0.1', resolve));
+  try {
+    const port = await findFreePortFrom(base, '127.0.0.1');
+    assert.equal(port, base + 1, 'should skip the occupied base port and return the next free one');
+
+    const blocker2 = createServer();
+    await new Promise((resolve) => blocker2.listen(base + 1, '127.0.0.1', resolve));
+    try {
+      const port2 = await findFreePortFrom(base, '127.0.0.1');
+      assert.equal(port2, base + 2, 'should skip two occupied ports');
+    } finally {
+      await new Promise((resolve) => blocker2.close(resolve));
+    }
+  } finally {
+    await new Promise((resolve) => blocker1.close(resolve));
+  }
+}
+
+// Bridge project-path gating: when expectedProjectPath is set, only an editor
+// announcing a matching project may take over; a mismatched editor is rejected
+// (not adopted, and crucially does NOT evict the matching one). With no
+// expectation set, any editor is accepted (legacy single-session behaviour).
+function testBridgeProjectPathGating() {
+  const ready = (sock, projectPath) =>
+    sock.emit('message', Buffer.from(JSON.stringify({ type: 'godot_ready', project_path: projectPath })));
+
+  // Case 1: unset expectation → accept-any (legacy).
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1');
+    const sock = new FakeSocket('legacy');
+    bridge.handleConnection(sock);
+    assert.equal(bridge.getStatus().connected, true, 'unset gate must accept any editor immediately');
+  }
+
+  // Case 2: matching project is adopted after godot_ready.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1');
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const sock = new FakeSocket('match');
+    bridge.handleConnection(sock);
+    assert.equal(bridge.getStatus().connected, false, 'gated bridge must wait for godot_ready before adopting');
+    ready(sock, '/mnt/c/games/proj-a');
+    assert.equal(bridge.getStatus().connected, true, 'matching project must be adopted');
+  }
+
+  // Case 3: WSL↔Windows path forms compare equal (C:/ vs /mnt/c/).
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1');
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const sock = new FakeSocket('winform');
+    bridge.handleConnection(sock);
+    ready(sock, 'C:/games/proj-a');
+    assert.equal(bridge.getStatus().connected, true, 'Windows-form project path must match the WSL form');
+  }
+
+  // Case 4: mismatched project is rejected and the matching one is NOT evicted.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1');
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const good = new FakeSocket('good');
+    bridge.handleConnection(good);
+    ready(good, '/mnt/c/games/proj-a');
+    assert.equal(bridge.getStatus().connected, true, 'matching editor connected');
+
+    const stray = new FakeSocket('stray');
+    bridge.handleConnection(stray);
+    ready(stray, '/mnt/c/games/proj-b');
+    assert.equal(stray.readyState, 3, 'stray editor (wrong project) must be closed');
+    assert.equal(bridge.getStatus().connected, true, 'stray editor must NOT evict the matching one (no hijack)');
+  }
+}
+
+// A gated socket that never sends godot_ready must be closed after the
+// probation window so its listeners can't accumulate, WITHOUT disturbing an
+// already-adopted matching socket. Uses a tiny injected probation timeout.
+async function testGatedProbationTimeout() {
+  const PROBATION = 30;
+  // A never-identifying socket is closed after the probation window.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1', undefined, PROBATION);
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const silent = new FakeSocket('silent');
+    bridge.handleConnection(silent);
+    assert.equal(bridge.getStatus().connected, false, 'silent gated socket is not adopted');
+    await delay(PROBATION * 4);
+    assert.equal(silent.readyState, 3, 'silent gated socket must be closed after the probation window');
+    assert.equal(bridge.getStatus().connected, false, 'bridge stays disconnected');
+  }
+  // An adopted matching socket must NOT be torn down by a later probation timer.
+  {
+    const bridge = createBridge(0, 1000, '127.0.0.1', undefined, PROBATION);
+    bridge.setExpectedProjectPath('/mnt/c/games/proj-a');
+    const good = new FakeSocket('good');
+    bridge.handleConnection(good);
+    good.emit('message', Buffer.from(JSON.stringify({ type: 'godot_ready', project_path: '/mnt/c/games/proj-a' })));
+    assert.equal(bridge.getStatus().connected, true, 'matching socket adopted');
+    await delay(PROBATION * 4);
+    assert.equal(bridge.getStatus().connected, true, 'adopted socket must survive past the probation window (timer was cleared)');
+  }
+}
+
+// Discovery-file round-trip: the TS server writes <project>/.gopeak/bridge.json;
+// the editor + runtime addons read res://.gopeak/bridge.json. Source-grep both
+// ends so the contract can't silently drift.
+function testDiscoveryFileRoundTrip() {
+  assert.match(INDEX_SOURCE, /\.gopeak['"]?,\s*['"]bridge\.json['"]/, 'index.ts must write <project>/.gopeak/bridge.json');
+  assert.match(INDEX_SOURCE, /private writeDiscoveryFile\(/, 'index.ts must define writeDiscoveryFile');
+  assert.match(INDEX_SOURCE, /private removeDiscoveryFile\(/, 'index.ts must define removeDiscoveryFile (cleanup)');
+  assert.match(MCP_CLIENT_SOURCE, /res:\/\/\.gopeak\/bridge\.json/, 'mcp_client.gd must read res://.gopeak/bridge.json');
+  assert.match(MCP_CLIENT_SOURCE, /_read_discovery_file_url\(\)/, 'mcp_client.gd must call _read_discovery_file_url() in _resolve_server_url');
+  // Discovery layer must be resolved BEFORE the env port_keys (so the
+  // per-session discovery file outranks the shared GOPEAK_BRIDGE_PORT env).
+  const discoveryIdx = MCP_CLIENT_SOURCE.indexOf('var discovery_url := _read_discovery_file_url()');
+  const portKeysIdx = MCP_CLIENT_SOURCE.indexOf('port_keys :=');
+  assert.ok(
+    discoveryIdx > 0 && portKeysIdx > 0 && discoveryIdx < portKeysIdx,
+    'discovery-file resolution must precede the env port_keys lookup',
+  );
+  assert.match(RUNTIME_SOURCE, /res:\/\/\.gopeak\/bridge\.json/, 'mcp_runtime_autoload.gd must read the discovery file');
+  assert.match(PLUGIN_SOURCE, /_read_discovery_dap_relay_port\(\)/, 'plugin.gd must read the discovery DAP relay port');
+}
+
+// Runtime control socket bind host must be configurable (WSL-safe superset of
+// upstream issue-38), defaulting to loopback for security. This exercises the
+// resolver as a real function call (not just a source grep) since "0.0.0.0 in
+// WSL→Windows mode" is the load-bearing WSL invariant.
+function testRuntimeBindHostConfigurable() {
+  // Addon side (source-grep — GDScript can't be imported here).
+  assert.match(RUNTIME_SOURCE, /func _resolve_bind_host\(\) -> String:/, 'runtime autoload must define _resolve_bind_host()');
+  assert.match(RUNTIME_SOURCE, /GOPEAK_RUNTIME_BIND_HOST/, 'runtime autoload must honour GOPEAK_RUNTIME_BIND_HOST');
+  assert.match(RUNTIME_SOURCE, /_server\.listen\(_port, bind_host\)/, 'runtime autoload must bind to the resolved host');
+  assert.match(RUNTIME_SOURCE, /DEFAULT_BIND_HOST\s*=\s*"127\.0\.0\.1"/, 'runtime autoload must default to loopback');
+
+  // TS side — exercise the actual resolver behaviour.
+  const savedEnv = process.env.GOPEAK_RUNTIME_BIND_HOST;
+  delete process.env.GOPEAK_RUNTIME_BIND_HOST;
+  try {
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: true, windowsTarget: true, mode: 'wsl_windows' }),
+      '0.0.0.0',
+      'WSL→Windows mode must bind 0.0.0.0 so a WSL server reaches the Windows game',
+    );
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: false, windowsTarget: false, mode: 'native' }),
+      '127.0.0.1',
+      'native mode must bind loopback for security',
+    );
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: true, windowsTarget: false, mode: 'wsl_linux' }),
+      '127.0.0.1',
+      'wsl_linux mode (Linux Godot) must bind loopback',
+    );
+    process.env.GOPEAK_RUNTIME_BIND_HOST = '192.168.1.5';
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: false, windowsTarget: false, mode: 'native' }),
+      '192.168.1.5',
+      'explicit GOPEAK_RUNTIME_BIND_HOST env must override',
+    );
+  } finally {
+    if (savedEnv === undefined) delete process.env.GOPEAK_RUNTIME_BIND_HOST;
+    else process.env.GOPEAK_RUNTIME_BIND_HOST = savedEnv;
+  }
+}
+
+// Close/play/state debug-game tools wired on both the addon and TS sides.
+function testDebugGameToolsWired() {
+  // Addon _tool_map + EditorInterface calls.
+  assert.match(TOOL_EXECUTOR_SOURCE, /"get_play_state": \[self, "_get_play_state"\]/, 'tool_executor.gd must route get_play_state');
+  assert.match(TOOL_EXECUTOR_SOURCE, /"play_scene": \[self, "_play_scene"\]/, 'tool_executor.gd must route play_scene');
+  assert.match(TOOL_EXECUTOR_SOURCE, /"stop_playing_scene": \[self, "_stop_playing_scene"\]/, 'tool_executor.gd must route stop_playing_scene');
+  assert.match(TOOL_EXECUTOR_SOURCE, /EditorInterface\.is_playing_scene\(\)/, 'tool_executor.gd must call EditorInterface.is_playing_scene()');
+  assert.match(TOOL_EXECUTOR_SOURCE, /EditorInterface\.stop_playing_scene\(\)/, 'tool_executor.gd must call EditorInterface.stop_playing_scene()');
+  assert.match(TOOL_EXECUTOR_SOURCE, /EditorInterface\.play_main_scene\(\)/, 'tool_executor.gd must call EditorInterface.play_main_scene()');
+  // TS dispatch + aliases + schemas.
+  assert.match(INDEX_SOURCE, /case 'get_play_state':/, 'index.ts dispatch must handle get_play_state');
+  assert.match(INDEX_SOURCE, /case 'play_scene':/, 'index.ts dispatch must handle play_scene');
+  assert.match(INDEX_SOURCE, /case 'stop_playing_scene':/, 'index.ts dispatch must handle stop_playing_scene');
+  assert.match(INDEX_SOURCE, /'editor\.play': 'play_scene'/, 'index.ts must alias editor.play → play_scene');
+  assert.match(INDEX_SOURCE, /'editor\.stop_play': 'stop_playing_scene'/, 'index.ts must alias editor.stop_play → stop_playing_scene');
+  assert.match(INDEX_SOURCE, /'editor\.play_state': 'get_play_state'/, 'index.ts must alias editor.play_state → get_play_state');
+  assert.match(INDEX_SOURCE, /editor_play_state:/, 'getEditorStatusPayload must expose editor_play_state for agent awareness');
+  assert.match(INDEX_SOURCE, /await this\.refreshPlayState\(\)/, 'get_editor_status must refresh play state via the bridge');
+  assert.match(TOOL_DEFS_SOURCE, /name: 'stop_playing_scene'/, 'tool-definitions.ts must register stop_playing_scene');
+  assert.match(TOOL_DEFS_SOURCE, /name: 'play_scene'/, 'tool-definitions.ts must register play_scene');
+  assert.match(TOOL_DEFS_SOURCE, /name: 'get_play_state'/, 'tool-definitions.ts must register get_play_state');
+  assert.match(TOOL_GROUPS_SOURCE, /'play_scene', 'stop_playing_scene', 'get_play_state'/, 'core_editor group must include the debug-game tools');
+}
+
 async function main() {
   testStaleDisconnectRegression();
   testLastWriterWinsTakeover();
@@ -1321,13 +1512,21 @@ async function main() {
     'runtime autoload should re-check socket status after poll() before get_available_bytes()',
   );
 
-  await testEditorStatusPortConflict();
+  await testBridgePortAutoAllocation();
   // Bridge-reliability tests (fix/bridge-reliability-and-port-symmetry).
   testRuntimePortAddonEnvOverride();
   await testBridgeSelfTest();
   await testStdinEofShutdown();
-  await testPidLockfileHealthyHandoff();
+  await testTwoInstancesCoexistOnDistinctPorts();
   await testOrphanReclamation();
+
+  // Multi-session isolation + close-debug-game suite.
+  await testPortAllocationNonCollision();
+  testBridgeProjectPathGating();
+  await testGatedProbationTimeout();
+  testDiscoveryFileRoundTrip();
+  testRuntimeBindHostConfigurable();
+  testDebugGameToolsWired();
   console.log('regression tests passed');
 }
 
