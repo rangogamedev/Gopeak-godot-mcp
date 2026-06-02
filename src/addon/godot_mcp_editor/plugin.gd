@@ -182,7 +182,9 @@ func _spawn_dap_relay_if_enabled() -> void:
 # Read the per-session DAP relay port from the gopeak discovery file. Returns 0
 # when absent/malformed so the caller keeps the default/user value.
 func _read_discovery_dap_relay_port() -> int:
-	var path := "res://.gopeak/bridge.json"
+	# Single source of truth for the discovery-file path: the const on the preloaded
+	# editor-client script (avoids a divergent copy of the literal here).
+	var path := MCPEditorClientScript.DISCOVERY_FILE
 	if not FileAccess.file_exists(path):
 		return 0
 	var f := FileAccess.open(path, FileAccess.READ)
