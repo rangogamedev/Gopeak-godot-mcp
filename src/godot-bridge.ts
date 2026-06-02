@@ -24,6 +24,10 @@ const PONG_MISS_LIMIT = 3;
 // 4001 is in the application-private range (4000-4999); 4000 was the legacy
 // "already connected" reject code, retired by last-writer-wins takeover.
 const PROJECT_MISMATCH_CLOSE_CODE = 4001;
+// A probationary (gated) socket that never sends godot_ready is closed after
+// this long so its listeners can't accumulate (e.g. port scans, mis-wired
+// clients). The real editor sends godot_ready immediately on open.
+const PROBATION_TIMEOUT_MS = 15_000;
 const BRIDGE_PORT_ENV_KEYS = ['GODOT_BRIDGE_PORT', 'MCP_BRIDGE_PORT', 'GOPEAK_BRIDGE_PORT'] as const;
 const BRIDGE_HOST_ENV_KEYS = ['GODOT_BRIDGE_HOST', 'MCP_BRIDGE_HOST', 'GOPEAK_BRIDGE_HOST'] as const;
 const BRIDGE_VERSION = (() => {
@@ -1048,6 +1052,16 @@ export class GodotBridge extends EventEmitter {
    * the active socket (if any) is never disturbed.
    */
   private handleGatedConnection(nextSocket: WebSocket): void {
+    let probationTimer: NodeJS.Timeout | null = null;
+    const endProbation = () => {
+      if (probationTimer) {
+        clearTimeout(probationTimer);
+        probationTimer = null;
+      }
+      nextSocket.off('message', onProbeMessage);
+      nextSocket.off('close', onProbeClose);
+    };
+
     const onProbeMessage = (data: RawData) => {
       let parsed: unknown;
       try {
@@ -1065,16 +1079,14 @@ export class GodotBridge extends EventEmitter {
         return;
       }
 
-      nextSocket.off('message', onProbeMessage);
-      nextSocket.off('close', onProbeClose);
+      endProbation();
 
       const projectPath = message.project_path;
       if (this.projectPathMatches(projectPath)) {
         this.log('info', `Accepting Godot connection for matching project: ${projectPath}`);
-        this.adoptConnection(nextSocket);
-        // Re-dispatch the consumed godot_ready so connectionInfo.projectPath is
-        // set and the godot_connected event carries the path.
-        this.handleMessage({ type: 'godot_ready', project_path: projectPath });
+        // Adopt with the known project path so connectionInfo.projectPath is set
+        // and a single godot_connected carries it (no re-dispatch / double emit).
+        this.adoptConnection(nextSocket, projectPath);
       } else {
         this.log(
           'warn',
@@ -1089,14 +1101,25 @@ export class GodotBridge extends EventEmitter {
     };
 
     const onProbeClose = () => {
-      nextSocket.off('message', onProbeMessage);
+      endProbation();
     };
 
     nextSocket.on('message', onProbeMessage);
     nextSocket.once('close', onProbeClose);
+    // Don't let a socket that never identifies itself hold listeners forever.
+    probationTimer = setTimeout(() => {
+      this.log('warn', 'Closing probationary Godot socket: no godot_ready within probation window');
+      endProbation();
+      try {
+        nextSocket.close(PROJECT_MISMATCH_CLOSE_CODE, 'no godot_ready');
+      } catch {
+        // best effort
+      }
+    }, PROBATION_TIMEOUT_MS);
+    probationTimer.unref?.();
   }
 
-  private adoptConnection(nextSocket: WebSocket): void {
+  private adoptConnection(nextSocket: WebSocket, knownProjectPath?: string): void {
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
       // Last-writer-wins. The editor client is a singleton, so a fresh inbound
       // connection is authoritative — the existing socket is either being
@@ -1118,12 +1141,17 @@ export class GodotBridge extends EventEmitter {
       // Seed the pong clock so the first keepalive interval can't false-evict a
       // brand-new connection before it has had a chance to reply.
       lastPongAt: new Date(),
+      // On the gated (isolated) path the project is already known from the
+      // probationary godot_ready, so seed it and emit godot_connected once with
+      // the path. On the legacy path it's undefined until the godot_ready
+      // message arrives (handleMessage sets it then).
+      projectPath: knownProjectPath,
     };
     this.missedPongs = 0;
 
     this.startKeepalive();
-    this.log('info', 'Godot editor connected');
-    this.emitBridgeEvent('godot_connected', { projectPath: this.connectionInfo.projectPath });
+    this.log('info', knownProjectPath ? `Godot editor connected (project: ${knownProjectPath})` : 'Godot editor connected');
+    this.emitBridgeEvent('godot_connected', { projectPath: knownProjectPath });
 
     nextSocket.on('message', (data) => {
       this.handleRawMessage(data);
