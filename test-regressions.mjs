@@ -20,6 +20,7 @@ import {
   resolveDefaultRuntimeHost,
   resolveDefaultDAPPort,
   resolveDefaultRuntimePort,
+  resolveDefaultRuntimeBindHost,
   normalizePathForCrossPlatformComparison,
   __resetWindowsHostIpCacheForTests,
 } from './build/wsl_interop.js';
@@ -1399,15 +1400,45 @@ function testDiscoveryFileRoundTrip() {
 }
 
 // Runtime control socket bind host must be configurable (WSL-safe superset of
-// upstream issue-38), defaulting to loopback for security.
+// upstream issue-38), defaulting to loopback for security. This exercises the
+// resolver as a real function call (not just a source grep) since "0.0.0.0 in
+// WSL→Windows mode" is the load-bearing WSL invariant.
 function testRuntimeBindHostConfigurable() {
+  // Addon side (source-grep — GDScript can't be imported here).
   assert.match(RUNTIME_SOURCE, /func _resolve_bind_host\(\) -> String:/, 'runtime autoload must define _resolve_bind_host()');
   assert.match(RUNTIME_SOURCE, /GOPEAK_RUNTIME_BIND_HOST/, 'runtime autoload must honour GOPEAK_RUNTIME_BIND_HOST');
   assert.match(RUNTIME_SOURCE, /_server\.listen\(_port, bind_host\)/, 'runtime autoload must bind to the resolved host');
   assert.match(RUNTIME_SOURCE, /DEFAULT_BIND_HOST\s*=\s*"127\.0\.0\.1"/, 'runtime autoload must default to loopback');
-  assert.match(WSL_INTEROP_SOURCE, /resolveDefaultRuntimeBindHost/, 'wsl_interop.ts must export resolveDefaultRuntimeBindHost');
-  // WSL→Windows must bind 0.0.0.0 so a WSL gopeak can reach the Windows game.
-  assert.match(WSL_INTEROP_SOURCE, /wsl_windows[\s\S]{0,80}0\.0\.0\.0/, 'WSL→Windows mode must use a 0.0.0.0 runtime bind host');
+
+  // TS side — exercise the actual resolver behaviour.
+  const savedEnv = process.env.GOPEAK_RUNTIME_BIND_HOST;
+  delete process.env.GOPEAK_RUNTIME_BIND_HOST;
+  try {
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: true, windowsTarget: true, mode: 'wsl_windows' }),
+      '0.0.0.0',
+      'WSL→Windows mode must bind 0.0.0.0 so a WSL server reaches the Windows game',
+    );
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: false, windowsTarget: false, mode: 'native' }),
+      '127.0.0.1',
+      'native mode must bind loopback for security',
+    );
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: true, windowsTarget: false, mode: 'wsl_linux' }),
+      '127.0.0.1',
+      'wsl_linux mode (Linux Godot) must bind loopback',
+    );
+    process.env.GOPEAK_RUNTIME_BIND_HOST = '192.168.1.5';
+    assert.equal(
+      resolveDefaultRuntimeBindHost({ isWSL: false, windowsTarget: false, mode: 'native' }),
+      '192.168.1.5',
+      'explicit GOPEAK_RUNTIME_BIND_HOST env must override',
+    );
+  } finally {
+    if (savedEnv === undefined) delete process.env.GOPEAK_RUNTIME_BIND_HOST;
+    else process.env.GOPEAK_RUNTIME_BIND_HOST = savedEnv;
+  }
 }
 
 // Close/play/state debug-game tools wired on both the addon and TS sides.
@@ -1423,6 +1454,8 @@ function testDebugGameToolsWired() {
   assert.match(INDEX_SOURCE, /case 'get_play_state':/, 'index.ts dispatch must handle get_play_state');
   assert.match(INDEX_SOURCE, /case 'play_scene':/, 'index.ts dispatch must handle play_scene');
   assert.match(INDEX_SOURCE, /case 'stop_playing_scene':/, 'index.ts dispatch must handle stop_playing_scene');
+  assert.match(INDEX_SOURCE, /'editor\.play': 'play_scene'/, 'index.ts must alias editor.play → play_scene');
+  assert.match(INDEX_SOURCE, /'editor\.stop_play': 'stop_playing_scene'/, 'index.ts must alias editor.stop_play → stop_playing_scene');
   assert.match(INDEX_SOURCE, /'editor\.play_state': 'get_play_state'/, 'index.ts must alias editor.play_state → get_play_state');
   assert.match(INDEX_SOURCE, /editor_play_state:/, 'getEditorStatusPayload must expose editor_play_state for agent awareness');
   assert.match(INDEX_SOURCE, /await this\.refreshPlayState\(\)/, 'get_editor_status must refresh play state via the bridge');

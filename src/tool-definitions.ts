@@ -60,7 +60,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         },
         {
           name: 'close_editor',
-          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Three-stage safety: (1) if a game-debug session is active, it is stopped first. (2) HITL gate: if the editor was NOT launched by this MCP server (launched_by_mcp=false), refuses by default — caller must opt in via force=true paired with i_understand_data_loss_risk=true OR via prefer_pid_kill=true. (3) Bridge-IPC path (preferred) enforces addon guards: fs_scanning (FS reimport in progress), modal_open (visible AcceptDialog), save_blocked (any open scene path is read-only). Auto-saves all open scenes before quit by default. Fallback: PID-kill SIGTERM/SIGKILL when bridge is disconnected but editor was launched by this MCP server.',
+          description: 'Closes the Godot Editor process (NOT just the running game — that is stop_project). Three-stage safety: (1) if a run_project game process is active, it is stopped first (an in-editor Play-button game is terminated with the editor; use stop_playing_scene to stop just that without closing the editor). (2) HITL gate: if the editor was NOT launched by this MCP server (launched_by_mcp=false), refuses by default — caller must opt in via force=true paired with i_understand_data_loss_risk=true OR via prefer_pid_kill=true. (3) Bridge-IPC path (preferred) enforces addon guards: fs_scanning (FS reimport in progress), modal_open (visible AcceptDialog), save_blocked (any open scene path is read-only). Auto-saves all open scenes before quit by default. Fallback: PID-kill SIGTERM/SIGKILL when bridge is disconnected but editor was launched by this MCP server.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -2301,7 +2301,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         // Editor Plugin Bridge Status
         {
           name: 'get_editor_status',
-          description: 'Returns the connection status of the Godot Editor Plugin bridge. Use to check if the editor is connected before using scene/resource tools that require the editor plugin.',
+          description: 'Returns the connection status of the Godot Editor Plugin bridge. Use to check if the editor is connected before using scene/resource tools that require the editor plugin. Also reports multi-session fields: session_project_path, project_gated, allocated_ports {bridge,runtime,dap_relay}, and editor_play_state {is_playing, played_scene} — the latter makes the agent aware of an in-editor Play-button debug game (stop it with stop_playing_scene).',
           inputSchema: {
             type: 'object',
             properties: {},

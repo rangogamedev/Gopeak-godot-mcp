@@ -1866,6 +1866,10 @@ class GodotServer {
       // Multi-session: the project this server is bound to + its allocated
       // ports, so an agent can confirm two worktrees got distinct ports.
       session_project_path: this.primaryProjectPath,
+      // True when the bridge rejects editors whose project doesn't match. False
+      // (accept-any) until a project is known — usually transient until the
+      // first launch_editor/run_project, but worth surfacing for diagnosis.
+      project_gated: this.godotBridge.getExpectedProjectPath() !== null,
       allocated_ports: {
         bridge: this.allocatedBridgePort || status.port,
         runtime: this.allocatedRuntimePort || null,
@@ -6157,9 +6161,10 @@ class GodotServer {
       );
     }
 
-    // Resolve once so diagnostic messages report the actual port the env
-    // override pointed handleRuntimeCommand at — not a stale 7777 literal.
-    const runtimePort = resolveDefaultRuntimePort();
+    // Resolve once so diagnostic messages report the actual port this session's
+    // handleRuntimeCommand probes — the allocated per-session port (multi-session),
+    // not a stale 7777 literal or the unoffset env default.
+    const runtimePort = this.allocatedRuntimePort || resolveDefaultRuntimePort();
 
     try {
       const runtime = await this.handleRuntimeCommand('ping', {});
@@ -7385,6 +7390,17 @@ class GodotServer {
       console.error('Godot MCP server running on stdio');
 
       this.godotReadyPromise = this.detectAndValidateGodotPath();
+      // Once the Godot path is known, rewrite the discovery file so its
+      // runtime_bind_host reflects the real interop mode. At startup godotPath
+      // may still be null and GODOT_PATH unset, which would mis-detect 'native'
+      // and record a loopback bind host that a WSL server can't reach on a
+      // Windows game. The rewrite corrects it (no-op if nothing was written yet
+      // — the later writeDiscoveryFile call then uses the resolved path).
+      void this.godotReadyPromise.then(() => {
+        if (this.discoveryFileProject) {
+          this.writeDiscoveryFile(this.discoveryFileProject);
+        }
+      }).catch(() => {});
 
       // Start the Godot Editor Bridge after the transport is live but
       // without awaiting the Godot-path probe. Bridge start is fast
