@@ -565,6 +565,8 @@ export class GodotBridge extends EventEmitter {
     private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS,
     // Overridable so tests can drive the keepalive/pong-timeout loop fast.
     private readonly keepaliveIntervalMs: number = KEEPALIVE_INTERVAL_MS,
+    // Overridable so tests can drive the gated-socket probation timeout fast.
+    private readonly probationTimeoutMs: number = PROBATION_TIMEOUT_MS,
   ) {
     super();
     this.registerProcessExitHandlers();
@@ -1115,7 +1117,7 @@ export class GodotBridge extends EventEmitter {
       } catch {
         // best effort
       }
-    }, PROBATION_TIMEOUT_MS);
+    }, this.probationTimeoutMs);
     probationTimer.unref?.();
   }
 
@@ -1460,6 +1462,6 @@ export function getDefaultBridge(): GodotBridge {
   return defaultBridge;
 }
 
-export function createBridge(port?: number, timeoutMs?: number, host?: string, keepaliveIntervalMs?: number): GodotBridge {
-  return new GodotBridge(port, host, timeoutMs, keepaliveIntervalMs);
+export function createBridge(port?: number, timeoutMs?: number, host?: string, keepaliveIntervalMs?: number, probationTimeoutMs?: number): GodotBridge {
+  return new GodotBridge(port, host, timeoutMs, keepaliveIntervalMs, probationTimeoutMs);
 }
