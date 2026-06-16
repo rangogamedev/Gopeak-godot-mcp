@@ -26,3 +26,6 @@ Thumbs.db
 
 # Coverage directory
 coverage/
+
+# Claude Code session-state (per-session lock / local overrides — not fork content)
+.claude/

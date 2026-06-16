@@ -107,6 +107,10 @@ class GodotServer {
   // The Godot project this session is bound to (path-gating + discovery file).
   private primaryProjectPath: string | null = null;
   private discoveryFileProject: string | null = null;
+  // Single-flight guard for opt-in auto-launch (GOPEAK_AUTO_LAUNCH_EDITOR): a
+  // concurrent burst of bridge tool calls shares one editor spawn instead of
+  // racing to start several editors for the same project.
+  private editorLaunchInFlight: Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> | null = null;
   // Last observed editor Play-button state, refreshed via the bridge on
   // get_editor_status so the agent is aware of a debug game it didn't spawn.
   private lastKnownPlayState: { is_playing: boolean; played_scene: string; fetchedAt: number } | null = null;
@@ -967,11 +971,21 @@ class GodotServer {
     // sessions would both probe 7777 and only one game would be reachable.
     const RUNTIME_PORT = this.allocatedRuntimePort || resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
-    const TIMEOUT_MS = 10000;
+    const timeoutOverride = Number.parseInt(process.env.GOPEAK_RUNTIME_TIMEOUT_MS || '', 10);
+    const TIMEOUT_MS = Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000;
+    const expectsScreenshot = command === 'capture_screenshot' || command === 'capture_viewport';
+    const screenshotDir = expectsScreenshot ? mkdtempSync(join(tmpdir(), 'gopeak-runtime-screenshot-')) : null;
+    const screenshotPath = screenshotDir ? join(screenshotDir, 'capture.png') : null;
+    const runtimeParams = screenshotPath ? { ...params, output_path: screenshotPath } : params;
+    const cleanupScreenshotDir = () => {
+      if (screenshotDir) {
+        rmSync(screenshotDir, { recursive: true, force: true });
+      }
+    };
 
     return new Promise((resolve) => {
       const socket = createTcpConnection({ port: RUNTIME_PORT, host: RUNTIME_HOST }, () => {
-        const payload = JSON.stringify({ command, params, id: Date.now() });
+        const payload = JSON.stringify({ command, params: runtimeParams, id: Date.now() });
         socket.write(payload + '\n');
       });
 
@@ -983,6 +997,7 @@ class GodotServer {
         }
         resolved = true;
         socket.destroy();
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: `Runtime command '${command}' timed out after ${TIMEOUT_MS}ms. Ensure the Godot game is running with the MCP runtime addon enabled.` }],
         });
@@ -996,7 +1011,36 @@ class GodotServer {
         clearTimeout(timer);
         socket.destroy();
 
+        if (parsed.type === 'screenshot_file' && parsed.path) {
+          const returnedPath = String(parsed.path);
+          if (!screenshotPath || normalize(returnedPath) !== normalize(screenshotPath)) {
+            cleanupScreenshotDir();
+            resolve({
+              content: [{ type: 'text', text: `Rejected screenshot file path outside the GoPeak-managed capture path: '${returnedPath}'` }],
+            });
+            return;
+          }
+          try {
+            const imageData = readFileSync(screenshotPath).toString('base64');
+            cleanupScreenshotDir();
+            resolve({
+              content: [
+                { type: 'text', text: `Screenshot captured: ${parsed.width}x${parsed.height} ${parsed.format}` },
+                { type: 'image', data: imageData, mimeType: 'image/png' },
+              ],
+            });
+          } catch (error) {
+            cleanupScreenshotDir();
+            const message = error instanceof Error ? error.message : String(error);
+            resolve({
+              content: [{ type: 'text', text: `Failed to read screenshot file '${screenshotPath}': ${message}` }],
+            });
+          }
+          return;
+        }
+
         if (parsed.type === 'screenshot' && parsed.data) {
+          cleanupScreenshotDir();
           resolve({
             content: [
               { type: 'text', text: `Screenshot captured: ${parsed.width}x${parsed.height} ${parsed.format}` },
@@ -1006,6 +1050,7 @@ class GodotServer {
           return;
         }
 
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
         });
@@ -1053,7 +1098,8 @@ class GodotServer {
         }
 
         if (parsedMessages.length > 0) {
-          const candidate = parsedMessages.find((message) => message?.type === 'screenshot' && message?.data)
+          const candidate = parsedMessages.find((message) => message?.type === 'screenshot_file' && message?.path)
+            ?? parsedMessages.find((message) => message?.type === 'screenshot' && message?.data)
             ?? parsedMessages.find((message) => message?.type === 'pong')
             ?? parsedMessages.find((message) => message?.type && message.type !== 'welcome')
             ?? null;
@@ -1072,6 +1118,7 @@ class GodotServer {
         clearTimeout(timer);
         const responseData = responseBuffer.toString('utf8').trim();
         resolved = true;
+        cleanupScreenshotDir();
         try {
           const parsed = JSON.parse(responseData);
           resolve({
@@ -1090,6 +1137,7 @@ class GodotServer {
         }
         resolved = true;
         clearTimeout(timer);
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: `Failed to connect to Godot runtime addon at ${RUNTIME_HOST}:${RUNTIME_PORT}: ${error.message}. Ensure the game is running with the MCP runtime autoload enabled.` }],
         });
@@ -1754,17 +1802,17 @@ class GodotServer {
       try {
         const execOptions = prepared.cwd ? { cwd: prepared.cwd } : undefined;
         const { stdout, stderr } = await execFileAsync(prepared.command, prepared.args, execOptions);
-        return { stdout: String(stdout), stderr: String(stderr) };
+        return { stdout: String(stdout), stderr: this.sanitizeGodotStderr(String(stderr)) };
       } finally {
         rmSync(paramsDir, { recursive: true, force: true });
       }
     } catch (error: unknown) {
-      // If execAsync throws, it still contains stdout/stderr
+      // If execFileAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
         const execError = error as Error & { stdout: string | Buffer; stderr: string | Buffer };
         return {
           stdout: String(execError.stdout),
-          stderr: String(execError.stderr),
+          stderr: this.sanitizeGodotStderr(String(execError.stderr)),
         };
       }
 
@@ -2304,70 +2352,12 @@ class GodotServer {
     }
 
     try {
-      // Ensure godotPath is set
-      if (!this.godotPath) {
-        await this.detectGodotPath();
-        if (!this.godotPath) {
-          return this.createErrorResponse(
-            'Could not find a valid Godot executable path',
-            [
-              'Ensure Godot is installed correctly',
-              'Set GODOT_PATH environment variable to specify the correct path',
-            ]
-          );
-        }
-      }
-
-      // Check if the project directory exists and contains a project.godot file
-      const projectFile = join(args.projectPath, 'project.godot');
-      if (!existsSync(projectFile)) {
-        return this.createErrorResponse(
-          `Not a valid Godot project: ${args.projectPath}`,
-          [
-            'Ensure the path points to a directory containing a project.godot file',
-            'Use list_projects to find valid Godot projects',
-          ]
-        );
-      }
-
-      // Bind this session to the project before spawning so the discovery file
-      // and bridge gate are in place when the editor's addon connects.
-      this.ensureSessionProject(args.projectPath);
-
-      const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
-      this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
-      const editorChild = spawn(prepared.command, prepared.args, {
-        stdio: 'pipe',
-        cwd: prepared.cwd,
-        env: this.buildGodotSpawnEnv(),
-      });
-
-      editorChild.on('error', (err: Error) => {
-        console.error('Failed to start Godot editor:', err);
-        if (this.editorProcess && this.editorProcess.process === editorChild) {
-          this.editorProcess = null;
-        }
-      });
-      editorChild.on('exit', () => {
-        if (this.editorProcess && this.editorProcess.process === editorChild) {
-          this.editorProcess = null;
-        }
-      });
-
-      this.editorProcess = {
-        process: editorChild,
-        projectPath: prepared.targetProjectPath,
-        launchedAt: Date.now(),
-        bridgePort: this.allocatedBridgePort || this.godotBridge.getStatus().port,
-        runtimePort: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
-        dapRelayPort: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
-      };
-
+      const displayPath = await this.launchEditorForProject(args.projectPath);
       return {
         content: [
           {
             type: 'text',
-            text: `Godot editor launched successfully for project at ${prepared.projectPathForDisplay}.`,
+            text: `Godot editor launched successfully for project at ${displayPath}.`,
           },
         ],
       };
@@ -2382,6 +2372,196 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Spawn a Godot editor bound to `projectPath` and track it. Shared by the
+   * launch_editor tool and the opt-in auto-launch path. Binds the session
+   * (discovery file + bridge gate) before spawning so the editor's addon
+   * connects to THIS session's ports. Throws on failure (missing Godot, not a
+   * project) for the caller to surface.
+   * @returns the display path for user-facing messages.
+   */
+  private async launchEditorForProject(projectPath: string): Promise<string> {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        throw new Error('Could not find a valid Godot executable path. Set GODOT_PATH or install Godot.');
+      }
+    }
+
+    const projectFile = join(projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      throw new Error(`Not a valid Godot project: ${projectPath} (no project.godot)`);
+    }
+
+    // Bind this session to the project before spawning so the discovery file
+    // and bridge gate are in place when the editor's addon connects.
+    this.ensureSessionProject(projectPath);
+
+    const prepared = this.prepareProjectScopedCommand(projectPath, ['-e']);
+    this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
+    const editorChild = spawn(prepared.command, prepared.args, {
+      stdio: 'pipe',
+      cwd: prepared.cwd,
+      env: this.buildGodotSpawnEnv(),
+    });
+
+    editorChild.on('error', (err: Error) => {
+      console.error('Failed to start Godot editor:', err);
+      if (this.editorProcess && this.editorProcess.process === editorChild) {
+        this.editorProcess = null;
+      }
+    });
+    editorChild.on('exit', () => {
+      if (this.editorProcess && this.editorProcess.process === editorChild) {
+        this.editorProcess = null;
+      }
+    });
+
+    this.editorProcess = {
+      process: editorChild,
+      projectPath: prepared.targetProjectPath,
+      launchedAt: Date.now(),
+      bridgePort: this.allocatedBridgePort || this.godotBridge.getStatus().port,
+      runtimePort: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
+      dapRelayPort: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
+    };
+
+    return prepared.projectPathForDisplay;
+  }
+
+  /**
+   * Opt-in (GOPEAK_AUTO_LAUNCH_EDITOR=1) recovery for a bridge tool called with
+   * no editor connected: spawn the editor for this session's bound project and
+   * wait (up to GOPEAK_AUTO_LAUNCH_TIMEOUT_MS, default 45000) for its addon to
+   * connect. Single-flight — a concurrent burst shares one spawn. Off by
+   * default so headless/CI runs are never surprised by a GUI editor.
+   */
+  private async maybeAutoLaunchEditor(): Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> {
+    const enabled = process.env.GOPEAK_AUTO_LAUNCH_EDITOR === '1';
+    const project = this.primaryProjectPath;
+
+    if (!enabled || !project) {
+      return {
+        connected: false,
+        errorPayload: {
+          error: 'Godot Editor not connected. Launch Godot Editor and enable the "Godot MCP Editor" plugin to use this tool.',
+          suggestion: enabled
+            ? 'Auto-launch is on but no project is bound to this session. Set GOPEAK_PROJECT_PATH (or start the server from the project root), or call launch_editor with an explicit projectPath.'
+            : 'Use launch_editor to open the editor, then enable the plugin in Project > Project Settings > Plugins. Tip: set GOPEAK_AUTO_LAUNCH_EDITOR=1 to auto-launch the bound project on demand.',
+          autoLaunch: enabled ? 'enabled-but-no-bound-project' : 'disabled',
+          boundProject: project ?? null,
+        },
+      };
+    }
+
+    // Single-flight across the WHOLE recovery (spawn + wait-for-connect), not
+    // just the spawn. launchEditorForProject resolves in microseconds (spawn is
+    // synchronous), so guarding only the spawn would leave the ~45s editor-boot
+    // window unguarded — a tool call retried mid-boot would then spawn a second
+    // editor. Concurrent or staggered callers join this one recovery and share
+    // its outcome.
+    // INVARIANT: the read of editorLaunchInFlight and the write-back below must
+    // stay await-free — that synchronous read-modify-write is what guarantees
+    // single-flight (two concurrent callers cannot both observe null). Do not
+    // insert an await between them.
+    let recovery = this.editorLaunchInFlight;
+    if (!recovery) {
+      recovery = this.runAutoLaunch(project);
+      this.editorLaunchInFlight = recovery;
+      const tracked = recovery;
+      void tracked.catch(() => undefined).finally(() => {
+        if (this.editorLaunchInFlight === tracked) {
+          this.editorLaunchInFlight = null;
+        }
+      });
+    }
+    return recovery;
+  }
+
+  /**
+   * Spawn (if needed) and wait for the editor's addon to connect, run under the
+   * maybeAutoLaunchEditor single-flight guard. Resolves connected=true once the
+   * bridge is live, or with an error payload if the spawn fails, the editor
+   * exits before connecting, or the connect times out.
+   */
+  private async runAutoLaunch(project: string): Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> {
+    if (this.godotBridge.isConnected()) {
+      return { connected: true };
+    }
+    const timeoutMs = this.resolveAutoLaunchTimeoutMs();
+    // Don't spawn a duplicate: a prior recovery may have already launched an
+    // editor that booted but hasn't connected (e.g. plugin not enabled). Only
+    // spawn when no editor is currently tracked.
+    if (this.editorProcess === null) {
+      try {
+        await this.launchEditorForProject(project);
+      } catch (err) {
+        return {
+          connected: false,
+          errorPayload: {
+            error: `Auto-launch failed: ${err instanceof Error ? err.message : String(err)}`,
+            boundProject: project,
+            autoLaunch: 'spawn-failed',
+          },
+        };
+      }
+    } else if (Date.now() - this.editorProcess.launchedAt >= timeoutMs) {
+      // The tracked editor has already had a full connect window and still
+      // hasn't connected — re-waiting another timeoutMs makes no progress and
+      // just blocks the caller. Report immediately so a retried tool call fails
+      // fast (the usual fix is enabling the Godot MCP Editor plugin).
+      return {
+        connected: false,
+        errorPayload: {
+          error: `The Godot editor for ${project} is running but its MCP addon has not connected.`,
+          suggestion: 'Enable the "Godot MCP Editor" plugin in this project (Project > Project Settings > Plugins), then retry. The editor is already open — no new launch was attempted.',
+          boundProject: project,
+          autoLaunch: 'connect-timeout',
+        },
+      };
+    }
+
+    // Poll for the addon to connect. Bail early if the spawned editor process
+    // dies first — spawn reports a bad GODOT_PATH via an async 'error'/'exit'
+    // event (it does not throw), which nulls editorProcess — so a
+    // misconfiguration surfaces promptly instead of after the full timeout.
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.godotBridge.isConnected()) {
+        return { connected: true };
+      }
+      if (this.editorProcess === null) {
+        return {
+          connected: false,
+          errorPayload: {
+            error: `Auto-launched editor for ${project} exited before its MCP addon connected.`,
+            suggestion: 'Check GODOT_PATH points to a real Godot executable, and that the project\'s "Godot MCP Editor" plugin is enabled (Project > Project Settings > Plugins).',
+            boundProject: project,
+            autoLaunch: 'editor-exited',
+          },
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (this.godotBridge.isConnected()) {
+      return { connected: true };
+    }
+    return {
+      connected: false,
+      errorPayload: {
+        error: `Auto-launched the Godot editor for ${project} but its MCP addon did not connect within ${timeoutMs}ms.`,
+        suggestion: 'Confirm the "Godot MCP Editor" plugin is enabled in this project (Project > Project Settings > Plugins). The editor may still be booting — retry the tool shortly.',
+        boundProject: project,
+        autoLaunch: 'connect-timeout',
+      },
+    };
+  }
+
+  private resolveAutoLaunchTimeoutMs(): number {
+    const raw = Number.parseInt(process.env.GOPEAK_AUTO_LAUNCH_TIMEOUT_MS || '', 10);
+    return Number.isInteger(raw) && raw > 0 ? raw : 45000;
   }
 
   /**
@@ -2514,13 +2694,13 @@ class GodotServer {
    */
   private async handleViaBridge(toolName: string, args: any): Promise<any> {
     if (!this.godotBridge.isConnected()) {
-      return {
-        content: [{ type: 'text', text: JSON.stringify({
-          error: 'Godot Editor not connected. Launch Godot Editor and enable the "Godot MCP Editor" plugin to use this tool.',
-          suggestion: 'Use the launch_editor tool to open the Godot Editor, then enable the plugin in Project > Project Settings > Plugins.',
-        }, null, 2) }],
-        isError: true,
-      };
+      const recovery = await this.maybeAutoLaunchEditor();
+      if (!recovery.connected) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(recovery.errorPayload, null, 2) }],
+          isError: true,
+        };
+      }
     }
     try {
       const normalizedArgs = this.normalizeParameters((args || {}) as OperationParams);
@@ -3501,6 +3681,31 @@ class GodotServer {
     }
 
     return null;
+  }
+
+  private sanitizeGodotStderr(stderr: string): string {
+    if (!stderr) {
+      return stderr;
+    }
+
+    const ignoredPatterns = [
+      /WARNING: ObjectDB instances leaked at exit/i,
+      /at:\s+cleanup\s+\(core\/object\/object\.cpp:/i,
+      /ERROR:\s+\d+\s+resources still in use at exit/i,
+      /at:\s+clear\s+\(core\/io\/resource\.cpp:/i,
+    ];
+
+    const filteredLines = stderr
+      .split(/\r?\n/)
+      .filter((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return false;
+        }
+        return !ignoredPatterns.some((pattern) => pattern.test(trimmed));
+      });
+
+    return filteredLines.join('\n').trim();
   }
 
   /**
@@ -7136,6 +7341,103 @@ class GodotServer {
   // Project Search Handlers
   // ============================================
 
+  private searchProjectNatively(
+    projectPath: string,
+    query: string,
+    fileTypes: string[],
+    useRegex: boolean,
+    caseSensitive: boolean,
+    maxResults: number
+  ): Record<string, unknown> {
+    const normalizedExtensions = new Set(
+      fileTypes.map((ext) => ext.replace(/^\./, '').toLowerCase()).filter(Boolean)
+    );
+    const result = {
+      query,
+      results: [] as Array<{ file: string; matches: Array<{ line: number; content: string; match: string }> }>,
+      summary: {
+        files_searched: 0,
+        files_with_matches: 0,
+        total_matches: 0,
+        truncated: false,
+      },
+    };
+
+    const regex = useRegex ? new RegExp(query, caseSensitive ? '' : 'i') : null;
+    const queryToCheck = caseSensitive ? query : query.toLowerCase();
+
+    const visit = (dirPath: string) => {
+      if (result.summary.total_matches >= maxResults) {
+        result.summary.truncated = true;
+        return;
+      }
+
+      for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+        if (result.summary.total_matches >= maxResults) {
+          result.summary.truncated = true;
+          return;
+        }
+
+        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.godot') {
+          continue;
+        }
+
+        const entryPath = join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          visit(entryPath);
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        const extension = entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() || '' : '';
+        if (!normalizedExtensions.has(extension)) {
+          continue;
+        }
+
+        result.summary.files_searched += 1;
+        const content = readFileSync(entryPath, 'utf8');
+        const lines = content.split('\n');
+        const matches: Array<{ line: number; content: string; match: string }> = [];
+
+        for (let index = 0; index < lines.length; index += 1) {
+          if (result.summary.total_matches >= maxResults) {
+            result.summary.truncated = true;
+            break;
+          }
+
+          const line = lines[index];
+          const match = regex
+            ? regex.exec(line)?.[0]
+            : ((caseSensitive ? line : line.toLowerCase()).includes(queryToCheck) ? query : '');
+
+          if (match) {
+            matches.push({
+              line: index + 1,
+              content: line.trim(),
+              match,
+            });
+            result.summary.total_matches += 1;
+          }
+        }
+
+        if (matches.length > 0) {
+          const relativePath = entryPath.slice(projectPath.length + 1).replace(/\\/g, '/');
+          result.results.push({
+            file: `res://${relativePath}`,
+            matches,
+          });
+          result.summary.files_with_matches += 1;
+        }
+      }
+    };
+
+    visit(projectPath);
+    return result;
+  }
+
   /**
    * Handle the search_project tool
    */
@@ -7172,18 +7474,17 @@ class GodotServer {
         caseSensitive: args.caseSensitive || false,
         maxResults: args.maxResults || 100,
       };
-
-      const { stdout, stderr } = await this.executeOperation('search_project', params, args.projectPath);
-
-      if (stderr && stderr.includes('ERROR')) {
-        return this.createErrorResponse(
-          `Failed to search project: ${stderr}`,
-          ['Check if the query/regex pattern is valid']
-        );
-      }
+      const result = this.searchProjectNatively(
+        args.projectPath,
+        params.query,
+        params.fileTypes,
+        params.regex,
+        params.caseSensitive,
+        params.maxResults
+      );
 
       return {
-        content: [{ type: 'text', text: this.extractLastJsonLine(stdout) || stdout.trim() }],
+        content: [{ type: 'text', text: JSON.stringify(result) }],
       };
     } catch (error: any) {
       return this.createErrorResponse(
