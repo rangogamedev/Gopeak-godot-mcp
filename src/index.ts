@@ -2462,6 +2462,10 @@ class GodotServer {
     // window unguarded — a tool call retried mid-boot would then spawn a second
     // editor. Concurrent or staggered callers join this one recovery and share
     // its outcome.
+    // INVARIANT: the read of editorLaunchInFlight and the write-back below must
+    // stay await-free — that synchronous read-modify-write is what guarantees
+    // single-flight (two concurrent callers cannot both observe null). Do not
+    // insert an await between them.
     let recovery = this.editorLaunchInFlight;
     if (!recovery) {
       recovery = this.runAutoLaunch(project);
@@ -2486,6 +2490,7 @@ class GodotServer {
     if (this.godotBridge.isConnected()) {
       return { connected: true };
     }
+    const timeoutMs = this.resolveAutoLaunchTimeoutMs();
     // Don't spawn a duplicate: a prior recovery may have already launched an
     // editor that booted but hasn't connected (e.g. plugin not enabled). Only
     // spawn when no editor is currently tracked.
@@ -2502,13 +2507,26 @@ class GodotServer {
           },
         };
       }
+    } else if (Date.now() - this.editorProcess.launchedAt >= timeoutMs) {
+      // The tracked editor has already had a full connect window and still
+      // hasn't connected — re-waiting another timeoutMs makes no progress and
+      // just blocks the caller. Report immediately so a retried tool call fails
+      // fast (the usual fix is enabling the Godot MCP Editor plugin).
+      return {
+        connected: false,
+        errorPayload: {
+          error: `The Godot editor for ${project} is running but its MCP addon has not connected.`,
+          suggestion: 'Enable the "Godot MCP Editor" plugin in this project (Project > Project Settings > Plugins), then retry. The editor is already open — no new launch was attempted.',
+          boundProject: project,
+          autoLaunch: 'connect-timeout',
+        },
+      };
     }
 
     // Poll for the addon to connect. Bail early if the spawned editor process
     // dies first — spawn reports a bad GODOT_PATH via an async 'error'/'exit'
     // event (it does not throw), which nulls editorProcess — so a
     // misconfiguration surfaces promptly instead of after the full timeout.
-    const timeoutMs = this.resolveAutoLaunchTimeoutMs();
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (this.godotBridge.isConnected()) {
