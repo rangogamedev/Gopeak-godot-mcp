@@ -205,9 +205,16 @@ async function main() {
     capabilities: {},
     clientInfo: { name: 'test-client', version: '1.0.0' }
   }));
-  await delay(1000);
-
-  const initResponses = parseJsonLines(stdout);
+  // Poll for the initialize response instead of a fixed delay: on slow or
+  // contended environments (WSL /mnt/c cold start, concurrent gopeak sessions)
+  // the server can take several seconds to finish bridge startup before it
+  // answers initialize.
+  let initResponses = [];
+  for (let waited = 0; waited < 15000; waited += 200) {
+    await delay(200);
+    initResponses = parseJsonLines(stdout);
+    if (initResponses.length > 0 && initResponses[0].result) break;
+  }
   if (initResponses.length > 0 && initResponses[0].result) {
     ok('MCP initialize response received');
     const caps = initResponses[0].result;
