@@ -96,6 +96,10 @@ echo
 echo "  project : $WORKTREE"
 echo "  server  : node $BUILD_ENTRY"
 echo "  godot   : $GODOT_PATH_RESOLVED"
+echo "  env     : auto-launch=$AUTO_LAUNCH profile=$TOOL_PROFILE groups=$STARTUP_GROUPS"
+if [ "$AUTO_LAUNCH" != "1" ]; then
+  echo "  ⚠ auto-launch is OFF (inherited GOPEAK_AUTO_LAUNCH_EDITOR=$AUTO_LAUNCH from your shell); unset it and re-run for the default."
+fi
 echo
 echo "Next:"
 echo "  • Keep this file local (it has machine-specific absolute paths). Add"
