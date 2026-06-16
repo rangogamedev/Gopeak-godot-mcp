@@ -123,7 +123,7 @@ In `compact` mode, 78 additional tools are organized into **22 groups** that act
 | `animation` | 5 | Animations, tracks, animation tree, state machine |
 | `plugin` | 3 | Enable/disable/list editor plugins |
 | `input` | 1 | Input action mapping |
-| `tilemap` | 2 | TileSet and TileMap cell painting |
+| `tilemap` | 2 | TileSet and TileMap/TileMapLayer cell painting |
 | `audio` | 4 | Audio buses, effects, volume |
 | `navigation` | 2 | Navigation regions and agents |
 | `theme_ui` | 3 | Theme colors, font sizes, shaders |
@@ -342,7 +342,7 @@ Common groups:
 | `dap` | optional-dap | Breakpoints, stepping, stack traces. Requires Godot DAP on port `6006`. |
 | `asset_store` | optional-network | External CC0 asset search/download. Network/provider dependent. |
 | `class_advanced` | trusted-static | ClassDB/inheritance discovery backed by static engine metadata. |
-| `tilemap` | audit-required | Must account for Godot 4.3+ `TileMapLayer` behavior before promotion. |
+| `tilemap` | audit-required | `set_tilemap_cells` handles both Godot-4.3+ `TileMapLayer` and the deprecated `TileMap`; promotion still pending broader fixture evidence. |
 | mutation groups | audit-required | Scene/resource/script/settings/signal/autoload/import/audio/navigation/theme/animation groups need fixture evidence before being marketed as fully trusted. |
 | `intent_tracking` | workflow-layer | Workflow memory/handoff helpers, not a Godot engine primitive. Keep opt-in. |
 

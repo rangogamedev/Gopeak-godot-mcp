@@ -260,33 +260,40 @@ func set_tilemap_cells(args: Dictionary) -> Dictionary:
 	if root == null:
 		return {"ok": false, "error": "Failed to instantiate scene"}
 
-	var tilemap: TileMap = null
+	# Support both TileMapLayer (the Godot-4 idiom, single-layer node) and the deprecated
+	# multi-layer TileMap (back-compat). Godot 4.3+ split TileMap into TileMapLayer nodes, so a
+	# tilemap node may be either; cast to Node and branch on the actual class below.
+	var node: Node = null
 	if node_path == "." or node_path == "":
-		tilemap = root as TileMap
+		node = root
 	else:
-		tilemap = root.get_node_or_null(node_path) as TileMap
+		node = root.get_node_or_null(node_path)
 
-	if tilemap == null:
+	if node == null or not (node is TileMapLayer or node is TileMap):
 		root.queue_free()
-		return {"ok": false, "error": "TileMap node not found", "tilemapNodePath": node_path}
+		return {"ok": false, "error": "TileMapLayer/TileMap node not found", "tilemapNodePath": node_path}
 
 	var layer := int(args.get("layer", 0))
 	var cells = args.get("cells", [])
 	if typeof(cells) != TYPE_ARRAY:
 		cells = []
 
+	var is_layer: bool = node is TileMapLayer
 	for cell in cells:
 		if typeof(cell) != TYPE_DICTIONARY:
 			continue
 		var coords: Dictionary = cell.get("coords", {})
 		var atlas_coords: Dictionary = cell.get("atlasCoords", {})
-		tilemap.set_cell(
-			layer,
-			Vector2i(int(coords.get("x", 0)), int(coords.get("y", 0))),
-			int(cell.get("sourceId", -1)),
-			Vector2i(int(atlas_coords.get("x", 0)), int(atlas_coords.get("y", 0))),
-			int(cell.get("alternativeTile", 0))
-		)
+		var coord_v := Vector2i(int(coords.get("x", 0)), int(coords.get("y", 0)))
+		var atlas_v := Vector2i(int(atlas_coords.get("x", 0)), int(atlas_coords.get("y", 0)))
+		var src_id := int(cell.get("sourceId", -1))
+		var alt := int(cell.get("alternativeTile", 0))
+		if is_layer:
+			# TileMapLayer.set_cell(coords, source_id, atlas_coords, alternative) — no layer arg.
+			(node as TileMapLayer).set_cell(coord_v, src_id, atlas_v, alt)
+		else:
+			# Deprecated TileMap.set_cell(layer, coords, source_id, atlas_coords, alternative).
+			(node as TileMap).set_cell(layer, coord_v, src_id, atlas_v, alt)
 
 	var save_result := _save_scene_root(root, scene_path)
 	root.queue_free()
