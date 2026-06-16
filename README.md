@@ -416,6 +416,8 @@ CLI bin names:
 | `GOPEAK_PROJECT_PATH` | Pin the project this session serves (path-gating + discovery file). Auto-detected from cwd / launch args when unset | auto-detect |
 | `GOPEAK_RUNTIME_PORT` | Base runtime-addon command-socket port (derives per session from the bridge offset) | `7777` |
 | `GOPEAK_RUNTIME_BIND_HOST` | Bind host for the in-game runtime control socket. Loopback by default; `0.0.0.0` auto-selected in WSL→Windows mode so a WSL server can reach a Windows game | `127.0.0.1` |
+| `GOPEAK_AUTO_LAUNCH_EDITOR` | Opt-in: when `1`, a bridge tool called with no editor connected auto-launches the editor for this session's bound project (requires `GOPEAK_PROJECT_PATH`/cwd). Off by default so headless/CI runs never spawn a GUI editor | `0` |
+| `GOPEAK_AUTO_LAUNCH_TIMEOUT_MS` | How long auto-launch waits for the editor's MCP addon to connect before returning an error | `45000` |
 
 ### Ports
 
@@ -444,6 +446,15 @@ different game stages across git worktrees). Each gopeak instance:
 - **Gates the bridge on the project path** — an editor whose `godot_ready` project doesn't match the
   one this session owns is rejected, so a stray editor can never hijack another session's connection.
 
+**One-command per-worktree binding.** A shared *user-scope* `godot` server starts project-agnostic, so
+it never writes a discovery file or gates its bridge — worktrees then collide on the default port. Run
+`bash scripts/gen-worktree-mcp.sh` from a worktree root to write a project-scoped `.mcp.json` that pins
+`GOPEAK_PROJECT_PATH` to that worktree and sets `GOPEAK_AUTO_LAUNCH_EDITOR=1` (overriding the user-scope
+server there). Each worktree's agent then binds its own project + bridge port automatically, and a bridge
+tool issued with **no editor open auto-launches one for that worktree** (waiting up to
+`GOPEAK_AUTO_LAUNCH_TIMEOUT_MS`). Keep the generated `.mcp.json` out of git — it holds machine-specific
+absolute paths.
+
 **LSP (`6005`) and raw DAP (`6006`) are global Godot editor settings** with no per-instance override,
 so when several editors run at once only the first to bind owns them; gopeak reports them as
 unavailable rather than hanging. The DAP *relay* port (`6016` base, per-project) is isolated per
@@ -461,6 +472,7 @@ output — is fully isolated per worktree.
 - **Need a tool that is not visible** → run `tool.catalog` to search and auto-activate matching groups, or use `tool.groups` to activate a specific group
 - **`get_editor_status` says disconnected while the Godot editor shows connected** → the editor is connected to a *different* session's bridge. `get_editor_status` reports this session's `port` and `session_project_path`; confirm the editor's project matches and that `<project>/.gopeak/bridge.json` exists (multiple instances each auto-allocate their own port, so the editor must read the discovery file to find the right one). Reopen/reload the editor plugin to re-resolve.
 - **Running a debug game and want to stop it / know if one is running** → `get_play_state` reports the in-editor Play-button game; `stop_playing_scene` stops it; `play_scene` starts it. `get_editor_status.editor_play_state` surfaces a game a human started. (These are distinct from `run_project`/`stop_project`, which manage a separate gopeak-spawned process.)
+- **Auto-launch isn't opening an editor** → confirm `GOPEAK_AUTO_LAUNCH_EDITOR=1` *and* a project is bound (set `GOPEAK_PROJECT_PATH`, run `scripts/gen-worktree-mcp.sh`, or start the server from the project root). The error response's `autoLaunch` field tells you which: `disabled`, `enabled-but-no-bound-project`, `spawn-failed`, or `connect-timeout`. On `connect-timeout`, enable the "Godot MCP Editor" plugin in the project so the launched editor connects back, then retry.
 - **(WSL) MCP server times out / needs `/mcp` reconnect on almost every fresh session** → you are launching the server from a `/mnt/c` (9p) path, whose slow `node_modules` load exceeds Claude Code's 30s `initialize` timeout. Run it from the native Linux filesystem instead — see [Installation → D) WSL](#d-wsl-windows-subsystem-for-linux--run-from-the-native-linux-filesystem)
 - **Runtime screenshots time out** → update the runtime addon so screenshot commands support the managed `output_path` flow. For slow runtime responses, raise `GOPEAK_RUNTIME_TIMEOUT_MS`; older addons may still time out on large inline base64 screenshots.
 - **Editor bridge disconnected** → stop duplicate `gopeak`/MCP servers that may already own bridge port `6505`; `get_editor_status` reports bridge startup errors such as `EADDRINUSE`.

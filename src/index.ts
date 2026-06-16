@@ -107,6 +107,10 @@ class GodotServer {
   // The Godot project this session is bound to (path-gating + discovery file).
   private primaryProjectPath: string | null = null;
   private discoveryFileProject: string | null = null;
+  // Single-flight guard for opt-in auto-launch (GOPEAK_AUTO_LAUNCH_EDITOR): a
+  // concurrent burst of bridge tool calls shares one editor spawn instead of
+  // racing to start several editors for the same project.
+  private editorLaunchInFlight: Promise<void> | null = null;
   // Last observed editor Play-button state, refreshed via the bridge on
   // get_editor_status so the agent is aware of a debug game it didn't spawn.
   private lastKnownPlayState: { is_playing: boolean; played_scene: string; fetchedAt: number } | null = null;
@@ -2348,70 +2352,12 @@ class GodotServer {
     }
 
     try {
-      // Ensure godotPath is set
-      if (!this.godotPath) {
-        await this.detectGodotPath();
-        if (!this.godotPath) {
-          return this.createErrorResponse(
-            'Could not find a valid Godot executable path',
-            [
-              'Ensure Godot is installed correctly',
-              'Set GODOT_PATH environment variable to specify the correct path',
-            ]
-          );
-        }
-      }
-
-      // Check if the project directory exists and contains a project.godot file
-      const projectFile = join(args.projectPath, 'project.godot');
-      if (!existsSync(projectFile)) {
-        return this.createErrorResponse(
-          `Not a valid Godot project: ${args.projectPath}`,
-          [
-            'Ensure the path points to a directory containing a project.godot file',
-            'Use list_projects to find valid Godot projects',
-          ]
-        );
-      }
-
-      // Bind this session to the project before spawning so the discovery file
-      // and bridge gate are in place when the editor's addon connects.
-      this.ensureSessionProject(args.projectPath);
-
-      const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-e']);
-      this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
-      const editorChild = spawn(prepared.command, prepared.args, {
-        stdio: 'pipe',
-        cwd: prepared.cwd,
-        env: this.buildGodotSpawnEnv(),
-      });
-
-      editorChild.on('error', (err: Error) => {
-        console.error('Failed to start Godot editor:', err);
-        if (this.editorProcess && this.editorProcess.process === editorChild) {
-          this.editorProcess = null;
-        }
-      });
-      editorChild.on('exit', () => {
-        if (this.editorProcess && this.editorProcess.process === editorChild) {
-          this.editorProcess = null;
-        }
-      });
-
-      this.editorProcess = {
-        process: editorChild,
-        projectPath: prepared.targetProjectPath,
-        launchedAt: Date.now(),
-        bridgePort: this.allocatedBridgePort || this.godotBridge.getStatus().port,
-        runtimePort: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
-        dapRelayPort: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
-      };
-
+      const displayPath = await this.launchEditorForProject(args.projectPath);
       return {
         content: [
           {
             type: 'text',
-            text: `Godot editor launched successfully for project at ${prepared.projectPathForDisplay}.`,
+            text: `Godot editor launched successfully for project at ${displayPath}.`,
           },
         ],
       };
@@ -2426,6 +2372,145 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Spawn a Godot editor bound to `projectPath` and track it. Shared by the
+   * launch_editor tool and the opt-in auto-launch path. Binds the session
+   * (discovery file + bridge gate) before spawning so the editor's addon
+   * connects to THIS session's ports. Throws on failure (missing Godot, not a
+   * project) for the caller to surface.
+   * @returns the display path for user-facing messages.
+   */
+  private async launchEditorForProject(projectPath: string): Promise<string> {
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        throw new Error('Could not find a valid Godot executable path. Set GODOT_PATH or install Godot.');
+      }
+    }
+
+    const projectFile = join(projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      throw new Error(`Not a valid Godot project: ${projectPath} (no project.godot)`);
+    }
+
+    // Bind this session to the project before spawning so the discovery file
+    // and bridge gate are in place when the editor's addon connects.
+    this.ensureSessionProject(projectPath);
+
+    const prepared = this.prepareProjectScopedCommand(projectPath, ['-e']);
+    this.logDebug(`Launching Godot editor for project: ${prepared.projectPathForDisplay}`);
+    const editorChild = spawn(prepared.command, prepared.args, {
+      stdio: 'pipe',
+      cwd: prepared.cwd,
+      env: this.buildGodotSpawnEnv(),
+    });
+
+    editorChild.on('error', (err: Error) => {
+      console.error('Failed to start Godot editor:', err);
+      if (this.editorProcess && this.editorProcess.process === editorChild) {
+        this.editorProcess = null;
+      }
+    });
+    editorChild.on('exit', () => {
+      if (this.editorProcess && this.editorProcess.process === editorChild) {
+        this.editorProcess = null;
+      }
+    });
+
+    this.editorProcess = {
+      process: editorChild,
+      projectPath: prepared.targetProjectPath,
+      launchedAt: Date.now(),
+      bridgePort: this.allocatedBridgePort || this.godotBridge.getStatus().port,
+      runtimePort: this.allocatedRuntimePort || resolveDefaultRuntimePort(),
+      dapRelayPort: this.allocatedDapRelayPort || DEFAULT_DAP_RELAY_PORT,
+    };
+
+    return prepared.projectPathForDisplay;
+  }
+
+  /**
+   * Opt-in (GOPEAK_AUTO_LAUNCH_EDITOR=1) recovery for a bridge tool called with
+   * no editor connected: spawn the editor for this session's bound project and
+   * wait (up to GOPEAK_AUTO_LAUNCH_TIMEOUT_MS, default 45000) for its addon to
+   * connect. Single-flight — a concurrent burst shares one spawn. Off by
+   * default so headless/CI runs are never surprised by a GUI editor.
+   */
+  private async maybeAutoLaunchEditor(): Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> {
+    const enabled = process.env.GOPEAK_AUTO_LAUNCH_EDITOR === '1';
+    const project = this.primaryProjectPath;
+
+    if (!enabled || !project) {
+      return {
+        connected: false,
+        errorPayload: {
+          error: 'Godot Editor not connected. Launch Godot Editor and enable the "Godot MCP Editor" plugin to use this tool.',
+          suggestion: enabled
+            ? 'Auto-launch is on but no project is bound to this session. Set GOPEAK_PROJECT_PATH (or start the server from the project root), or call launch_editor with an explicit projectPath.'
+            : 'Use launch_editor to open the editor, then enable the plugin in Project > Project Settings > Plugins. Tip: set GOPEAK_AUTO_LAUNCH_EDITOR=1 to auto-launch the bound project on demand.',
+          autoLaunch: enabled ? 'enabled-but-no-bound-project' : 'disabled',
+          boundProject: project ?? null,
+        },
+      };
+    }
+
+    try {
+      // Single-flight: reuse an in-progress launch so a burst of tool calls
+      // doesn't spawn multiple editors for the same project.
+      let launch = this.editorLaunchInFlight;
+      if (!launch) {
+        launch = this.launchEditorForProject(project).then(() => undefined);
+        this.editorLaunchInFlight = launch;
+        const tracked = launch;
+        void tracked.catch(() => undefined).finally(() => {
+          if (this.editorLaunchInFlight === tracked) {
+            this.editorLaunchInFlight = null;
+          }
+        });
+      }
+      await launch;
+    } catch (err) {
+      return {
+        connected: false,
+        errorPayload: {
+          error: `Auto-launch failed: ${err instanceof Error ? err.message : String(err)}`,
+          boundProject: project,
+          autoLaunch: 'spawn-failed',
+        },
+      };
+    }
+
+    const timeoutMs = this.resolveAutoLaunchTimeoutMs();
+    if (await this.waitForBridgeConnected(timeoutMs)) {
+      return { connected: true };
+    }
+    return {
+      connected: false,
+      errorPayload: {
+        error: `Auto-launched the Godot editor for ${project} but its MCP addon did not connect within ${timeoutMs}ms.`,
+        suggestion: 'Confirm the "Godot MCP Editor" plugin is enabled in this project (Project > Project Settings > Plugins). The editor may still be booting — retry the tool shortly.',
+        boundProject: project,
+        autoLaunch: 'connect-timeout',
+      },
+    };
+  }
+
+  private resolveAutoLaunchTimeoutMs(): number {
+    const raw = Number.parseInt(process.env.GOPEAK_AUTO_LAUNCH_TIMEOUT_MS || '', 10);
+    return Number.isInteger(raw) && raw > 0 ? raw : 45000;
+  }
+
+  private async waitForBridgeConnected(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.godotBridge.isConnected()) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return this.godotBridge.isConnected();
   }
 
   /**
@@ -2558,13 +2643,13 @@ class GodotServer {
    */
   private async handleViaBridge(toolName: string, args: any): Promise<any> {
     if (!this.godotBridge.isConnected()) {
-      return {
-        content: [{ type: 'text', text: JSON.stringify({
-          error: 'Godot Editor not connected. Launch Godot Editor and enable the "Godot MCP Editor" plugin to use this tool.',
-          suggestion: 'Use the launch_editor tool to open the Godot Editor, then enable the plugin in Project > Project Settings > Plugins.',
-        }, null, 2) }],
-        isError: true,
-      };
+      const recovery = await this.maybeAutoLaunchEditor();
+      if (!recovery.connected) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(recovery.errorPayload, null, 2) }],
+          isError: true,
+        };
+      }
     }
     try {
       const normalizedArgs = this.normalizeParameters((args || {}) as OperationParams);

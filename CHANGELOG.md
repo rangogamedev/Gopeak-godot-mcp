@@ -9,7 +9,9 @@ All notable changes to GoPeak (godot-mcp) will be documented in this file.
 - **Per-project discovery file** `<project>/.gopeak/bridge.json`, written by the server and read by the editor + runtime addons so each project's Godot connects to *its* session's ports with zero manual config. Addon precedence: discovery file → env → Project Settings → default. Add `.gopeak/` to your project's `.gitignore`.
 - **Bridge project-path gating**: the bridge rejects any editor whose `godot_ready` project path doesn't match the project this session owns, so a stray editor can never hijack another session's connection (no more cross-session eviction).
 - **Debug-game control + awareness**: new `play_scene`, `stop_playing_scene`, and `get_play_state` tools drive/stop the in-editor Play-button game (distinct from `run_project`/`stop_project`). `get_editor_status` now reports `editor_play_state`, `session_project_path`, and `allocated_ports`, so the agent is aware of a debug game even one a human started.
-- `GOPEAK_PROJECT_PATH` and `GOPEAK_RUNTIME_BIND_HOST` environment variables.
+- **Opt-in editor auto-launch**: with `GOPEAK_AUTO_LAUNCH_EDITOR=1`, a bridge tool called while no editor is connected spawns the editor for this session's bound project and waits (up to `GOPEAK_AUTO_LAUNCH_TIMEOUT_MS`, default `45000`) for its addon to connect, instead of erroring. Single-flight — a burst of tool calls shares one spawn — and **off by default**, so headless/CI runs are never surprised by a GUI editor.
+- `scripts/gen-worktree-mcp.sh`: writes a per-worktree `.mcp.json` that pins `GOPEAK_PROJECT_PATH` and enables auto-launch, so each git worktree's agent binds its own Godot project + bridge port (overriding the shared user-scope server) with zero manual config.
+- `GOPEAK_PROJECT_PATH`, `GOPEAK_RUNTIME_BIND_HOST`, `GOPEAK_AUTO_LAUNCH_EDITOR`, and `GOPEAK_AUTO_LAUNCH_TIMEOUT_MS` environment variables.
 
 ### Changed
 - An occupied bridge port no longer leaves the server bridge-unavailable — it auto-allocates the next free port and comes up healthy.
