@@ -123,7 +123,7 @@ In `compact` mode, 78 additional tools are organized into **22 groups** that act
 | `animation` | 5 | Animations, tracks, animation tree, state machine |
 | `plugin` | 3 | Enable/disable/list editor plugins |
 | `input` | 1 | Input action mapping |
-| `tilemap` | 2 | TileSet and TileMap cell painting |
+| `tilemap` | 2 | TileSet and TileMap/TileMapLayer cell painting |
 | `audio` | 4 | Audio buses, effects, volume |
 | `navigation` | 2 | Navigation regions and agents |
 | `theme_ui` | 3 | Theme colors, font sizes, shaders |

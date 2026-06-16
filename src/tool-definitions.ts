@@ -1837,7 +1837,7 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         },
         {
           name: 'set_tilemap_cells',
-          description: 'Places tiles in a TileMap node. Use to programmatically generate levels or modify existing tilemaps.',
+          description: 'Places tiles in a TileMap or TileMapLayer node. Supports both the Godot-4.3+ TileMapLayer node and the deprecated multi-layer TileMap. Use to programmatically generate levels or modify existing tilemaps.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1847,15 +1847,15 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
               },
               scenePath: {
                 type: 'string',
-                description: 'Path to scene containing TileMap (e.g., "scenes/level1.tscn")',
+                description: 'Path to scene containing the TileMap/TileMapLayer (e.g., "scenes/level1.tscn")',
               },
               tilemapNodePath: {
                 type: 'string',
-                description: 'Path to TileMap node (e.g., "World/TileMap")',
+                description: 'Path to the TileMap or TileMapLayer node (e.g., "World/TileMapLayer")',
               },
               layer: {
                 type: 'number',
-                description: 'TileMap layer index. Default: 0',
+                description: 'Layer index for deprecated multi-layer TileMap nodes. Default: 0. Ignored for TileMapLayer nodes (each is a single layer).',
               },
               cells: {
                 type: 'array',
