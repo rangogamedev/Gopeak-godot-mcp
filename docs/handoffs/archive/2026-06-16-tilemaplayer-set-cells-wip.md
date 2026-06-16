@@ -1,10 +1,13 @@
 ---
-status: active
+status: done
 task: finish + land the uncommitted TileMapLayer support in set_tilemap_cells (addon WIP)
-branch: wsl-windows-compat
+branch: fix/tilemaplayer-set-cells
+resolution: landed in PR rangogamedev/Gopeak-godot-mcp#8 (commit a5b0ae2) → fork/main
 ---
 
 # Handoff — TileMapLayer support in `set_tilemap_cells` (uncommitted addon WIP)
+
+> **DONE (2026-06-16):** Landed as PR **rangogamedev/Gopeak-godot-mcp#8** (`fix/tilemaplayer-set-cells`, commit `a5b0ae2`) into `fork/main`. The `resource_tools.gd` change is the expected `+19/-12`. Added a headless regression test (both node kinds + on-disk persistence) and updated the tool description + README. Verified two ways: `npm run ci` green on ext4 (new test runs), and a **live** headless editor driven over the bridge returned `{"cellCount":1}` for both a `TileMapLayer` and a legacy `TileMap` scene with cells persisting on reopen (`layer_src=0, map_src=0`). The off-path headless `godot_operations.gd` copy was intentionally left untouched.
 
 **For:** verify, test, and land the uncommitted `resource_tools.gd` change. This is the **only** loose end — the rest of the session is merged (see Context).
 **Date:** 2026-06-16
