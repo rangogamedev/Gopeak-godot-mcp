@@ -63,9 +63,16 @@ if [ -f "$OUT" ] && ! grep -q '"GOPEAK_PROJECT_PATH"' "$OUT" 2>/dev/null; then
   echo "• backed up existing $OUT → $BAK"
 fi
 
+# Tool profile + pre-activated groups are env-overridable (same pattern as
+# GODOT_PATH / GOPEAK_BUILD_ENTRY) with the established defaults.
+TOOL_PROFILE="${GOPEAK_TOOL_PROFILE:-compact}"
+STARTUP_GROUPS="${GOPEAK_STARTUP_ACTIVE_GROUPS:-dap,lsp,runtime}"
+AUTO_LAUNCH="${GOPEAK_AUTO_LAUNCH_EDITOR:-1}"
+
 # Emit JSON via node so paths with spaces/backslashes are escaped correctly.
 WORKTREE="$WORKTREE" BUILD_ENTRY="$BUILD_ENTRY" \
 GODOT_PATH_RESOLVED="$GODOT_PATH_RESOLVED" OUT="$OUT" \
+TOOL_PROFILE="$TOOL_PROFILE" STARTUP_GROUPS="$STARTUP_GROUPS" AUTO_LAUNCH="$AUTO_LAUNCH" \
 node -e '
   const fs = require("fs");
   const cfg = { mcpServers: { godot: {
@@ -74,9 +81,9 @@ node -e '
     env: {
       GODOT_PATH: process.env.GODOT_PATH_RESOLVED,
       GOPEAK_PROJECT_PATH: process.env.WORKTREE,
-      GOPEAK_AUTO_LAUNCH_EDITOR: "1",
-      GOPEAK_TOOL_PROFILE: "compact",
-      GOPEAK_STARTUP_ACTIVE_GROUPS: "dap,lsp,runtime",
+      GOPEAK_AUTO_LAUNCH_EDITOR: process.env.AUTO_LAUNCH,
+      GOPEAK_TOOL_PROFILE: process.env.TOOL_PROFILE,
+      GOPEAK_STARTUP_ACTIVE_GROUPS: process.env.STARTUP_GROUPS,
     },
   } } };
   fs.writeFileSync(process.env.OUT, JSON.stringify(cfg, null, 2) + "\n");
