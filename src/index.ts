@@ -110,7 +110,7 @@ class GodotServer {
   // Single-flight guard for opt-in auto-launch (GOPEAK_AUTO_LAUNCH_EDITOR): a
   // concurrent burst of bridge tool calls shares one editor spawn instead of
   // racing to start several editors for the same project.
-  private editorLaunchInFlight: Promise<void> | null = null;
+  private editorLaunchInFlight: Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> | null = null;
   // Last observed editor Play-button state, refreshed via the bridge on
   // get_editor_status so the agent is aware of a debug game it didn't spawn.
   private lastKnownPlayState: { is_playing: boolean; played_scene: string; fetchedAt: number } | null = null;
@@ -1807,7 +1807,7 @@ class GodotServer {
         rmSync(paramsDir, { recursive: true, force: true });
       }
     } catch (error: unknown) {
-      // If execAsync throws, it still contains stdout/stderr
+      // If execFileAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
         const execError = error as Error & { stdout: string | Buffer; stderr: string | Buffer };
         return {
@@ -2456,34 +2456,78 @@ class GodotServer {
       };
     }
 
-    try {
-      // Single-flight: reuse an in-progress launch so a burst of tool calls
-      // doesn't spawn multiple editors for the same project.
-      let launch = this.editorLaunchInFlight;
-      if (!launch) {
-        launch = this.launchEditorForProject(project).then(() => undefined);
-        this.editorLaunchInFlight = launch;
-        const tracked = launch;
-        void tracked.catch(() => undefined).finally(() => {
-          if (this.editorLaunchInFlight === tracked) {
-            this.editorLaunchInFlight = null;
-          }
-        });
+    // Single-flight across the WHOLE recovery (spawn + wait-for-connect), not
+    // just the spawn. launchEditorForProject resolves in microseconds (spawn is
+    // synchronous), so guarding only the spawn would leave the ~45s editor-boot
+    // window unguarded — a tool call retried mid-boot would then spawn a second
+    // editor. Concurrent or staggered callers join this one recovery and share
+    // its outcome.
+    let recovery = this.editorLaunchInFlight;
+    if (!recovery) {
+      recovery = this.runAutoLaunch(project);
+      this.editorLaunchInFlight = recovery;
+      const tracked = recovery;
+      void tracked.catch(() => undefined).finally(() => {
+        if (this.editorLaunchInFlight === tracked) {
+          this.editorLaunchInFlight = null;
+        }
+      });
+    }
+    return recovery;
+  }
+
+  /**
+   * Spawn (if needed) and wait for the editor's addon to connect, run under the
+   * maybeAutoLaunchEditor single-flight guard. Resolves connected=true once the
+   * bridge is live, or with an error payload if the spawn fails, the editor
+   * exits before connecting, or the connect times out.
+   */
+  private async runAutoLaunch(project: string): Promise<{ connected: boolean; errorPayload?: Record<string, unknown> }> {
+    if (this.godotBridge.isConnected()) {
+      return { connected: true };
+    }
+    // Don't spawn a duplicate: a prior recovery may have already launched an
+    // editor that booted but hasn't connected (e.g. plugin not enabled). Only
+    // spawn when no editor is currently tracked.
+    if (this.editorProcess === null) {
+      try {
+        await this.launchEditorForProject(project);
+      } catch (err) {
+        return {
+          connected: false,
+          errorPayload: {
+            error: `Auto-launch failed: ${err instanceof Error ? err.message : String(err)}`,
+            boundProject: project,
+            autoLaunch: 'spawn-failed',
+          },
+        };
       }
-      await launch;
-    } catch (err) {
-      return {
-        connected: false,
-        errorPayload: {
-          error: `Auto-launch failed: ${err instanceof Error ? err.message : String(err)}`,
-          boundProject: project,
-          autoLaunch: 'spawn-failed',
-        },
-      };
     }
 
+    // Poll for the addon to connect. Bail early if the spawned editor process
+    // dies first — spawn reports a bad GODOT_PATH via an async 'error'/'exit'
+    // event (it does not throw), which nulls editorProcess — so a
+    // misconfiguration surfaces promptly instead of after the full timeout.
     const timeoutMs = this.resolveAutoLaunchTimeoutMs();
-    if (await this.waitForBridgeConnected(timeoutMs)) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.godotBridge.isConnected()) {
+        return { connected: true };
+      }
+      if (this.editorProcess === null) {
+        return {
+          connected: false,
+          errorPayload: {
+            error: `Auto-launched editor for ${project} exited before its MCP addon connected.`,
+            suggestion: 'Check GODOT_PATH points to a real Godot executable, and that the project\'s "Godot MCP Editor" plugin is enabled (Project > Project Settings > Plugins).',
+            boundProject: project,
+            autoLaunch: 'editor-exited',
+          },
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (this.godotBridge.isConnected()) {
       return { connected: true };
     }
     return {
@@ -2500,17 +2544,6 @@ class GodotServer {
   private resolveAutoLaunchTimeoutMs(): number {
     const raw = Number.parseInt(process.env.GOPEAK_AUTO_LAUNCH_TIMEOUT_MS || '', 10);
     return Number.isInteger(raw) && raw > 0 ? raw : 45000;
-  }
-
-  private async waitForBridgeConnected(timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (this.godotBridge.isConnected()) {
-        return true;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    return this.godotBridge.isConnected();
   }
 
   /**
