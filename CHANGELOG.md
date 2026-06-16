@@ -24,6 +24,15 @@ All notable changes to GoPeak (godot-mcp) will be documented in this file.
 ### Added
 - `scripts/wsl-setup.sh`: helper that builds the server on the native Linux filesystem and prints the `claude mcp add -s user` command to register it (for WSL users avoiding the `/mnt/c` cold-start timeout).
 
+## [2.3.7] - 2026-05-14
+
+### Changed
+- Documented the Godot 4 migration-safe tool policy and package claims for trusted workflows.
+- Added the MCP resources, prompts, and dynamic exposure audit artifact for the next Godot-native cleanup lane.
+
+### Fixed
+- Refreshed production dependency locks so the production npm audit gate passes on current CI.
+
 ## [2.3.6] - 2026-04-05
 
 ### Fixed

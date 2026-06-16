@@ -371,7 +371,23 @@ func _cmd_capture_screenshot(params: Dictionary) -> Dictionary:
 	var viewport = get_viewport()
 	if viewport == null:
 		return {"type": "error", "message": "No viewport available"}
+	return _capture_viewport_image(viewport, params)
+
+
+func _cmd_capture_viewport(params: Dictionary) -> Dictionary:
+	var viewport_path = String(params.get("viewportPath", params.get("viewport_path", "")))
+	if viewport_path.is_empty():
+		return _cmd_capture_screenshot(params)
 	
+	var node = get_tree().root.get_node_or_null(viewport_path)
+	if node == null:
+		return {"type": "error", "message": "Viewport not found: " + viewport_path}
+	if not node is Viewport:
+		return {"type": "error", "message": "Node is not a Viewport: " + viewport_path}
+	return _capture_viewport_image(node as Viewport, params)
+
+
+func _capture_viewport_image(viewport: Viewport, params: Dictionary) -> Dictionary:
 	var viewport_texture = viewport.get_texture()
 	if viewport_texture == null:
 		return {"type": "error", "message": "No viewport texture available"}
@@ -385,24 +401,36 @@ func _cmd_capture_screenshot(params: Dictionary) -> Dictionary:
 	if width > 0 and height > 0:
 		image.resize(width, height)
 	
-	var png_bytes = image.save_png_to_buffer()
-	if png_bytes.is_empty():
-		return {"type": "error", "message": "Failed to encode screenshot as PNG"}
-	
-	var base64_str = Marshalls.raw_to_base64(png_bytes)
+	var requested_path = String(params.get("output_path", params.get("outputPath", "")))
+	if requested_path.is_empty():
+		var png_bytes = image.save_png_to_buffer()
+		if png_bytes.is_empty():
+			return {"type": "error", "message": "Failed to encode screenshot as PNG"}
+
+		return {
+			"type": "screenshot",
+			"format": "png",
+			"encoding": "base64",
+			"width": image.get_width(),
+			"height": image.get_height(),
+			"data": Marshalls.raw_to_base64(png_bytes)
+		}
+
+	var screenshot_path = requested_path
+	if screenshot_path.begins_with("user://") or screenshot_path.begins_with("res://"):
+		screenshot_path = ProjectSettings.globalize_path(screenshot_path)
+	var save_error = image.save_png(screenshot_path)
+	if save_error != OK:
+		return {"type": "error", "message": "Failed to save screenshot as PNG: " + str(save_error)}
 	
 	return {
-		"type": "screenshot",
+		"type": "screenshot_file",
 		"format": "png",
-		"encoding": "base64",
+		"encoding": "file",
 		"width": image.get_width(),
 		"height": image.get_height(),
-		"data": base64_str
+		"path": screenshot_path
 	}
-
-
-func _cmd_capture_viewport(params: Dictionary) -> Dictionary:
-	return _cmd_capture_screenshot(params)
 
 
 func _cmd_inject_action(params: Dictionary) -> Dictionary:
@@ -431,13 +459,17 @@ func _cmd_inject_action(params: Dictionary) -> Dictionary:
 
 
 func _cmd_inject_key(params: Dictionary) -> Dictionary:
-	var keycode = int(params.get("keycode", 0))
+	var keycode_raw: Variant = params.get("keycode", 0)
 	var pressed = bool(params.get("pressed", true))
 	var key_label = String(params.get("key_label", ""))
-	
+
+	if keycode_raw is String and not (keycode_raw as String).is_empty() and key_label.is_empty():
+		key_label = keycode_raw as String
+	var keycode: int = 0 if keycode_raw is String else int(keycode_raw)
+
 	var event = InputEventKey.new()
 	event.pressed = pressed
-	
+
 	if not key_label.is_empty():
 		event.keycode = OS.find_keycode_from_string(key_label)
 		if event.keycode == KEY_NONE:
@@ -458,19 +490,22 @@ func _cmd_inject_key(params: Dictionary) -> Dictionary:
 
 
 func _cmd_inject_mouse_click(params: Dictionary) -> Dictionary:
-	var position = params.get("position", Vector2.ZERO)
-	var button = int(params.get("button", MOUSE_BUTTON_LEFT))
-	var pressed = bool(params.get("pressed", true))
-	
-	if position is Array:
-		if position.size() < 2:
-			return {"type": "error", "message": "position array must contain [x, y]"}
-		position = Vector2(float(position[0]), float(position[1]))
-	elif position is Vector2:
-		position = position
+	var position: Vector2
+	if params.has("x") and params.has("y"):
+		position = Vector2(float(params["x"]), float(params["y"]))
 	else:
-		return {"type": "error", "message": "position must be Vector2 or [x, y]"}
-	
+		var pos_raw = params.get("position", Vector2.ZERO)
+		if pos_raw is Array:
+			if pos_raw.size() < 2:
+				return {"type": "error", "message": "position array must contain [x, y]"}
+			position = Vector2(float(pos_raw[0]), float(pos_raw[1]))
+		elif pos_raw is Vector2:
+			position = pos_raw
+		else:
+			return {"type": "error", "message": "position must be Vector2 or [x, y]"}
+	var button: int = _resolve_mouse_button(params.get("button", MOUSE_BUTTON_LEFT))
+	var pressed = bool(params.get("pressed", true))
+
 	var event = InputEventMouseButton.new()
 	event.position = position
 	event.global_position = position
@@ -488,24 +523,29 @@ func _cmd_inject_mouse_click(params: Dictionary) -> Dictionary:
 
 
 func _cmd_inject_mouse_motion(params: Dictionary) -> Dictionary:
-	var position = params.get("position", Vector2.ZERO)
-	var relative = params.get("relative", Vector2.ZERO)
-	
-	if position is Array:
-		if position.size() < 2:
-			return {"type": "error", "message": "position array must contain [x, y]"}
-		position = Vector2(float(position[0]), float(position[1]))
-	elif position is Vector2:
-		position = position
+	var position: Vector2
+	if params.has("x") and params.has("y"):
+		position = Vector2(float(params["x"]), float(params["y"]))
 	else:
-		return {"type": "error", "message": "position must be Vector2 or [x, y]"}
-	
-	if relative is Array:
-		if relative.size() < 2:
+		var pos_raw = params.get("position", Vector2.ZERO)
+		if pos_raw is Array:
+			if pos_raw.size() < 2:
+				return {"type": "error", "message": "position array must contain [x, y]"}
+			position = Vector2(float(pos_raw[0]), float(pos_raw[1]))
+		elif pos_raw is Vector2:
+			position = pos_raw
+		else:
+			return {"type": "error", "message": "position must be Vector2 or [x, y]"}
+	var rel_raw = params.get("relative", Vector2.ZERO)
+	var relative: Vector2
+	if params.has("relativeX") and params.has("relativeY"):
+		relative = Vector2(float(params["relativeX"]), float(params["relativeY"]))
+	elif rel_raw is Array:
+		if rel_raw.size() < 2:
 			return {"type": "error", "message": "relative array must contain [x, y]"}
-		relative = Vector2(float(relative[0]), float(relative[1]))
-	elif relative is Vector2:
-		relative = relative
+		relative = Vector2(float(rel_raw[0]), float(rel_raw[1]))
+	elif rel_raw is Vector2:
+		relative = rel_raw
 	else:
 		return {"type": "error", "message": "relative must be Vector2 or [x, y]"}
 	
@@ -692,6 +732,18 @@ func _deserialize_value(value) -> Variant:
 		return arr
 	else:
 		return value
+
+
+func _resolve_mouse_button(raw: Variant) -> int:
+	if raw is String:
+		match (raw as String).to_lower():
+			"left": return MOUSE_BUTTON_LEFT
+			"right": return MOUSE_BUTTON_RIGHT
+			"middle": return MOUSE_BUTTON_MIDDLE
+			"wheel_up", "wheelup": return MOUSE_BUTTON_WHEEL_UP
+			"wheel_down", "wheeldown": return MOUSE_BUTTON_WHEEL_DOWN
+			_: return MOUSE_BUTTON_LEFT
+	return int(raw)
 
 
 func _send_response(client: StreamPeerTCP, data: Dictionary) -> void:

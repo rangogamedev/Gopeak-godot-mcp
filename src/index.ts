@@ -967,11 +967,21 @@ class GodotServer {
     // sessions would both probe 7777 and only one game would be reachable.
     const RUNTIME_PORT = this.allocatedRuntimePort || resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
-    const TIMEOUT_MS = 10000;
+    const timeoutOverride = Number.parseInt(process.env.GOPEAK_RUNTIME_TIMEOUT_MS || '', 10);
+    const TIMEOUT_MS = Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000;
+    const expectsScreenshot = command === 'capture_screenshot' || command === 'capture_viewport';
+    const screenshotDir = expectsScreenshot ? mkdtempSync(join(tmpdir(), 'gopeak-runtime-screenshot-')) : null;
+    const screenshotPath = screenshotDir ? join(screenshotDir, 'capture.png') : null;
+    const runtimeParams = screenshotPath ? { ...params, output_path: screenshotPath } : params;
+    const cleanupScreenshotDir = () => {
+      if (screenshotDir) {
+        rmSync(screenshotDir, { recursive: true, force: true });
+      }
+    };
 
     return new Promise((resolve) => {
       const socket = createTcpConnection({ port: RUNTIME_PORT, host: RUNTIME_HOST }, () => {
-        const payload = JSON.stringify({ command, params, id: Date.now() });
+        const payload = JSON.stringify({ command, params: runtimeParams, id: Date.now() });
         socket.write(payload + '\n');
       });
 
@@ -983,6 +993,7 @@ class GodotServer {
         }
         resolved = true;
         socket.destroy();
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: `Runtime command '${command}' timed out after ${TIMEOUT_MS}ms. Ensure the Godot game is running with the MCP runtime addon enabled.` }],
         });
@@ -996,7 +1007,36 @@ class GodotServer {
         clearTimeout(timer);
         socket.destroy();
 
+        if (parsed.type === 'screenshot_file' && parsed.path) {
+          const returnedPath = String(parsed.path);
+          if (!screenshotPath || normalize(returnedPath) !== normalize(screenshotPath)) {
+            cleanupScreenshotDir();
+            resolve({
+              content: [{ type: 'text', text: `Rejected screenshot file path outside the GoPeak-managed capture path: '${returnedPath}'` }],
+            });
+            return;
+          }
+          try {
+            const imageData = readFileSync(screenshotPath).toString('base64');
+            cleanupScreenshotDir();
+            resolve({
+              content: [
+                { type: 'text', text: `Screenshot captured: ${parsed.width}x${parsed.height} ${parsed.format}` },
+                { type: 'image', data: imageData, mimeType: 'image/png' },
+              ],
+            });
+          } catch (error) {
+            cleanupScreenshotDir();
+            const message = error instanceof Error ? error.message : String(error);
+            resolve({
+              content: [{ type: 'text', text: `Failed to read screenshot file '${screenshotPath}': ${message}` }],
+            });
+          }
+          return;
+        }
+
         if (parsed.type === 'screenshot' && parsed.data) {
+          cleanupScreenshotDir();
           resolve({
             content: [
               { type: 'text', text: `Screenshot captured: ${parsed.width}x${parsed.height} ${parsed.format}` },
@@ -1006,6 +1046,7 @@ class GodotServer {
           return;
         }
 
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: JSON.stringify(parsed, null, 2) }],
         });
@@ -1053,7 +1094,8 @@ class GodotServer {
         }
 
         if (parsedMessages.length > 0) {
-          const candidate = parsedMessages.find((message) => message?.type === 'screenshot' && message?.data)
+          const candidate = parsedMessages.find((message) => message?.type === 'screenshot_file' && message?.path)
+            ?? parsedMessages.find((message) => message?.type === 'screenshot' && message?.data)
             ?? parsedMessages.find((message) => message?.type === 'pong')
             ?? parsedMessages.find((message) => message?.type && message.type !== 'welcome')
             ?? null;
@@ -1072,6 +1114,7 @@ class GodotServer {
         clearTimeout(timer);
         const responseData = responseBuffer.toString('utf8').trim();
         resolved = true;
+        cleanupScreenshotDir();
         try {
           const parsed = JSON.parse(responseData);
           resolve({
@@ -1090,6 +1133,7 @@ class GodotServer {
         }
         resolved = true;
         clearTimeout(timer);
+        cleanupScreenshotDir();
         resolve({
           content: [{ type: 'text', text: `Failed to connect to Godot runtime addon at ${RUNTIME_HOST}:${RUNTIME_PORT}: ${error.message}. Ensure the game is running with the MCP runtime autoload enabled.` }],
         });
@@ -1754,7 +1798,7 @@ class GodotServer {
       try {
         const execOptions = prepared.cwd ? { cwd: prepared.cwd } : undefined;
         const { stdout, stderr } = await execFileAsync(prepared.command, prepared.args, execOptions);
-        return { stdout: String(stdout), stderr: String(stderr) };
+        return { stdout: String(stdout), stderr: this.sanitizeGodotStderr(String(stderr)) };
       } finally {
         rmSync(paramsDir, { recursive: true, force: true });
       }
@@ -1764,7 +1808,7 @@ class GodotServer {
         const execError = error as Error & { stdout: string | Buffer; stderr: string | Buffer };
         return {
           stdout: String(execError.stdout),
-          stderr: String(execError.stderr),
+          stderr: this.sanitizeGodotStderr(String(execError.stderr)),
         };
       }
 
@@ -3501,6 +3545,31 @@ class GodotServer {
     }
 
     return null;
+  }
+
+  private sanitizeGodotStderr(stderr: string): string {
+    if (!stderr) {
+      return stderr;
+    }
+
+    const ignoredPatterns = [
+      /WARNING: ObjectDB instances leaked at exit/i,
+      /at:\s+cleanup\s+\(core\/object\/object\.cpp:/i,
+      /ERROR:\s+\d+\s+resources still in use at exit/i,
+      /at:\s+clear\s+\(core\/io\/resource\.cpp:/i,
+    ];
+
+    const filteredLines = stderr
+      .split(/\r?\n/)
+      .filter((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return false;
+        }
+        return !ignoredPatterns.some((pattern) => pattern.test(trimmed));
+      });
+
+    return filteredLines.join('\n').trim();
   }
 
   /**
@@ -7136,6 +7205,103 @@ class GodotServer {
   // Project Search Handlers
   // ============================================
 
+  private searchProjectNatively(
+    projectPath: string,
+    query: string,
+    fileTypes: string[],
+    useRegex: boolean,
+    caseSensitive: boolean,
+    maxResults: number
+  ): Record<string, unknown> {
+    const normalizedExtensions = new Set(
+      fileTypes.map((ext) => ext.replace(/^\./, '').toLowerCase()).filter(Boolean)
+    );
+    const result = {
+      query,
+      results: [] as Array<{ file: string; matches: Array<{ line: number; content: string; match: string }> }>,
+      summary: {
+        files_searched: 0,
+        files_with_matches: 0,
+        total_matches: 0,
+        truncated: false,
+      },
+    };
+
+    const regex = useRegex ? new RegExp(query, caseSensitive ? '' : 'i') : null;
+    const queryToCheck = caseSensitive ? query : query.toLowerCase();
+
+    const visit = (dirPath: string) => {
+      if (result.summary.total_matches >= maxResults) {
+        result.summary.truncated = true;
+        return;
+      }
+
+      for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+        if (result.summary.total_matches >= maxResults) {
+          result.summary.truncated = true;
+          return;
+        }
+
+        if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.godot') {
+          continue;
+        }
+
+        const entryPath = join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          visit(entryPath);
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        const extension = entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() || '' : '';
+        if (!normalizedExtensions.has(extension)) {
+          continue;
+        }
+
+        result.summary.files_searched += 1;
+        const content = readFileSync(entryPath, 'utf8');
+        const lines = content.split('\n');
+        const matches: Array<{ line: number; content: string; match: string }> = [];
+
+        for (let index = 0; index < lines.length; index += 1) {
+          if (result.summary.total_matches >= maxResults) {
+            result.summary.truncated = true;
+            break;
+          }
+
+          const line = lines[index];
+          const match = regex
+            ? regex.exec(line)?.[0]
+            : ((caseSensitive ? line : line.toLowerCase()).includes(queryToCheck) ? query : '');
+
+          if (match) {
+            matches.push({
+              line: index + 1,
+              content: line.trim(),
+              match,
+            });
+            result.summary.total_matches += 1;
+          }
+        }
+
+        if (matches.length > 0) {
+          const relativePath = entryPath.slice(projectPath.length + 1).replace(/\\/g, '/');
+          result.results.push({
+            file: `res://${relativePath}`,
+            matches,
+          });
+          result.summary.files_with_matches += 1;
+        }
+      }
+    };
+
+    visit(projectPath);
+    return result;
+  }
+
   /**
    * Handle the search_project tool
    */
@@ -7172,18 +7338,17 @@ class GodotServer {
         caseSensitive: args.caseSensitive || false,
         maxResults: args.maxResults || 100,
       };
-
-      const { stdout, stderr } = await this.executeOperation('search_project', params, args.projectPath);
-
-      if (stderr && stderr.includes('ERROR')) {
-        return this.createErrorResponse(
-          `Failed to search project: ${stderr}`,
-          ['Check if the query/regex pattern is valid']
-        );
-      }
+      const result = this.searchProjectNatively(
+        args.projectPath,
+        params.query,
+        params.fileTypes,
+        params.regex,
+        params.caseSensitive,
+        params.maxResults
+      );
 
       return {
-        content: [{ type: 'text', text: this.extractLastJsonLine(stdout) || stdout.trim() }],
+        content: [{ type: 'text', text: JSON.stringify(result) }],
       };
     } catch (error: any) {
       return this.createErrorResponse(
