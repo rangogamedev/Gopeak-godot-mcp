@@ -1,6 +1,6 @@
 {
   "name": "gopeak",
-  "version": "2.3.7",
+  "version": "2.3.8",
   "mcpName": "io.github.HaD0Yun/gopeak",
   "description": "GoPeak — MCP server for trusted Godot 4 workflows with compact/dynamic tool profiles, setup-gated LSP/DAP/runtime integrations, and migration-safe legacy compatibility.",
   "type": "module",
