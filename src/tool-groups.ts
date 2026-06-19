@@ -78,8 +78,8 @@ export const TOOL_GROUPS: Record<string, ToolGroupDefinition> = {
   },
   testing: {
     description: 'Screenshot capture and input injection for testing',
-    tools: ['capture_screenshot', 'capture_viewport', 'inject_action', 'inject_key', 'inject_mouse_click', 'inject_mouse_motion'],
-    keywords: ['screenshot', 'capture', 'inject input', 'simulate', 'test input', 'inject key', 'inject mouse', 'viewport capture'],
+    tools: ['capture_screenshot', 'capture_viewport', 'capture_editor_viewport', 'inject_action', 'inject_key', 'inject_mouse_click', 'inject_mouse_motion'],
+    keywords: ['screenshot', 'capture', 'inject input', 'simulate', 'test input', 'inject key', 'inject mouse', 'viewport capture', 'editor screenshot'],
   },
   dx_tools: {
     description: 'Developer experience tools (error log, health, usages, scaffold)',
