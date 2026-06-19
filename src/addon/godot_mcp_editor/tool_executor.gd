@@ -98,7 +98,10 @@ func _init_tools() -> void:
 		# Debug-game (editor Play button) tools
 		"get_play_state": [self, "_get_play_state"],
 		"play_scene": [self, "_play_scene"],
-		"stop_playing_scene": [self, "_stop_playing_scene"]
+		"stop_playing_scene": [self, "_stop_playing_scene"],
+
+		# Visual capture (editor 2D canvas)
+		"capture_editor_viewport": [self, "_capture_editor_viewport"]
 	}
 
 
@@ -145,6 +148,50 @@ func _stop_playing_scene(_args: Dictionary) -> Dictionary:
 		return { "ok": true, "was_playing": false, "note": "no scene was playing" }
 	EditorInterface.stop_playing_scene()
 	return { "ok": true, "was_playing": true }
+
+
+## Capture the editor's 2D viewport (the scene on the editor canvas) to a PNG.
+## Args (optional): output_path (String) — absolute path to write the PNG; when
+##   empty, returns inline base64. width/height (int) — resize the capture.
+## Returns { ok, type, path|data, width, height, format } or { ok:false, error }.
+## NOTE: captures the 2D editor canvas, so editor grid/gizmos/selection are
+## included. For a clean player-facing render, run the scene + capture_screenshot.
+func _capture_editor_viewport(args: Dictionary) -> Dictionary:
+	if not EditorInterface.has_method("get_editor_viewport_2d"):
+		return { "ok": false, "error": "get_editor_viewport_2d() unavailable in this Godot build (needs 4.1+)" }
+	var viewport: SubViewport = EditorInterface.get_editor_viewport_2d()
+	if viewport == null:
+		return { "ok": false, "error": "editor 2D viewport unavailable" }
+	var tex: Texture2D = viewport.get_texture()
+	if tex == null:
+		return { "ok": false, "error": "editor viewport texture unavailable" }
+	var image: Image = tex.get_image()
+	if image == null:
+		return { "ok": false, "error": "editor viewport image not ready (no rendered frame) — interact with the 2D canvas and retry" }
+
+	var target_w := int(args.get("width", 0))
+	var target_h := int(args.get("height", 0))
+	if target_w > 0 and target_h > 0:
+		image.resize(target_w, target_h, Image.INTERPOLATE_LANCZOS)
+
+	var output_path: String = str(args.get("output_path", "")).strip_edges()
+	if output_path.is_empty():
+		var buffer := image.save_png_to_buffer()
+		if buffer.is_empty():
+			return { "ok": false, "error": "save_png_to_buffer returned empty" }
+		return {
+			"ok": true, "type": "screenshot",
+			"data": Marshalls.raw_to_base64(buffer),
+			"width": image.get_width(), "height": image.get_height(), "format": "png"
+		}
+
+	var err := image.save_png(output_path)
+	if err != OK:
+		return { "ok": false, "error": "save_png failed (err %d) writing %s" % [err, output_path], "path": output_path }
+	return {
+		"ok": true, "type": "screenshot_file", "path": output_path,
+		"width": image.get_width(), "height": image.get_height(), "format": "png"
+	}
 
 
 ## Probe the resource filesystem scanning state without side effects.

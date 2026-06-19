@@ -2240,6 +2240,17 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
             },
           },
         },
+        {
+          name: 'capture_editor_viewport',
+          description: 'Capture the Godot EDITOR 2D viewport (the scene being edited on the editor canvas) as a PNG — no running game required. Shows the as-authored design canvas (includes editor grid/gizmos/selection). For the clean rendered result the player sees, run the scene and use capture_screenshot instead.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              width: { type: 'number', description: 'Target width in pixels (default: editor viewport width)' },
+              height: { type: 'number', description: 'Target height in pixels (default: editor viewport height)' },
+            },
+          },
+        },
         // Input Injection Tools (runtime addon TCP port 7777)
         {
           name: 'inject_action',
