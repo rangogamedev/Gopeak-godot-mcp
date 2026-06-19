@@ -2299,6 +2299,8 @@ class GodotServer {
           return await this.handleRuntimeCommand('capture_screenshot', request.params.arguments);
         case 'capture_viewport':
           return await this.handleRuntimeCommand('capture_viewport', request.params.arguments);
+        case 'capture_editor_viewport':
+          return await this.handleEditorScreenshot(request.params.arguments);
         case 'inject_action':
           return await this.handleRuntimeCommand('inject_action', request.params.arguments);
         case 'inject_key':
@@ -2685,6 +2687,73 @@ class GodotServer {
           'Verify the project path is accessible',
         ]
       );
+    }
+  }
+
+  /**
+   * Capture the editor's 2D viewport via the editor bridge. Mirrors the runtime
+   * screenshot read-back, but routes through the editor bridge and writes the PNG
+   * to a Windows-visible temp path so a Windows Godot can write a file the WSL
+   * bridge reads back (same pattern as the @file: operation params).
+   */
+  private async handleEditorScreenshot(args: any): Promise<any> {
+    if (!this.godotBridge.isConnected()) {
+      const recovery = await this.maybeAutoLaunchEditor();
+      if (!recovery.connected) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(recovery.errorPayload, null, 2) }],
+          isError: true,
+        };
+      }
+    }
+
+    const interop = this.getWSLInteropDetails(this.godotPath);
+    const tempRoot = resolveWSLWindowsTempDir(interop) ?? tmpdir();
+    const shotDir = mkdtempSync(join(tempRoot, 'gopeak-editor-screenshot-'));
+    const shotPath = join(shotDir, 'capture.png');
+    const cleanup = () => { try { rmSync(shotDir, { recursive: true, force: true }); } catch {} };
+
+    try {
+      // Windows-form path for Godot; we read the PNG back from the WSL mount.
+      const shotPathForGodot = wslTranslatePathForGodot(shotPath, interop, 'Editor screenshot file');
+      const normalizedArgs = this.normalizeParameters((args || {}) as OperationParams);
+      const result = await this.godotBridge.invokeTool('capture_editor_viewport', {
+        ...(normalizedArgs as Record<string, unknown>),
+        output_path: shotPathForGodot,
+      }) as Record<string, unknown>;
+
+      if (result && result.type === 'screenshot_file') {
+        const imageData = readFileSync(shotPath).toString('base64');
+        cleanup();
+        return {
+          content: [
+            { type: 'text', text: `Editor viewport captured: ${result.width}x${result.height} ${result.format}` },
+            { type: 'image', data: imageData, mimeType: 'image/png' },
+          ],
+        };
+      }
+
+      if (result && result.type === 'screenshot' && result.data) {
+        cleanup();
+        return {
+          content: [
+            { type: 'text', text: `Editor viewport captured: ${result.width}x${result.height} ${result.format}` },
+            { type: 'image', data: String(result.data), mimeType: 'image/png' },
+          ],
+        };
+      }
+
+      cleanup();
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        isError: !!(result && result.ok === false),
+      };
+    } catch (error) {
+      cleanup();
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }, null, 2) }],
+        isError: true,
+      };
     }
   }
 
