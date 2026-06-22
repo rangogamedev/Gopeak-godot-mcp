@@ -1571,6 +1571,18 @@ async function main() {
     /'run_project', 'run_project_headless'/,
     'core_editor group should include run_project_headless next to run_project',
   );
+  // Runtime screenshot output_path must be WSL-translated to the Windows-form path so the Windows Godot
+  // process can write it (a Linux /tmp path fails with "Failed to save screenshot as PNG: 7").
+  assert.match(
+    INDEX_SOURCE,
+    /resolveWSLWindowsTempDir\(screenshotInterop\)\s*\?\?\s*tmpdir\(\)/,
+    'runtime screenshot temp dir should sit under a Windows-visible root in WSL mode',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /output_path: screenshotPathForGodot/,
+    'runtime screenshot should send the Godot-form (Windows) path as output_path',
+  );
   assert.match(
     CLI_NOTIFY_SOURCE,
     /const wantsStar = await askYesNo\('[^']*Star GoPeak on GitHub\? \(y\/n\): '\);\s*\n\s*if \(wantsStar\) \{\s*\n\s*await handleStar\(\);/m,

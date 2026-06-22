@@ -975,9 +975,19 @@ class GodotServer {
     const timeoutOverride = Number.parseInt(process.env.GOPEAK_RUNTIME_TIMEOUT_MS || '', 10);
     const TIMEOUT_MS = Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000;
     const expectsScreenshot = command === 'capture_screenshot' || command === 'capture_viewport';
-    const screenshotDir = expectsScreenshot ? mkdtempSync(join(tmpdir(), 'gopeak-runtime-screenshot-')) : null;
+    // Under WSL→Windows Godot, the runtime addon writes the PNG from the WINDOWS Godot process, which
+    // cannot write a Linux /tmp path (FileAccess fails: "Failed to save screenshot as PNG: 7"). Put the
+    // temp file under a Windows-visible dir (e.g. /mnt/c/.../Temp) and hand Godot the Windows-form path
+    // as output_path; the server reads it back via the Linux-form path (same physical file). Mirrors the
+    // editor capture_editor_viewport path. Non-WSL: both forms are identical, so this is a no-op there.
+    const screenshotInterop = this.getWSLInteropDetails(this.godotPath);
+    const screenshotTempRoot = resolveWSLWindowsTempDir(screenshotInterop) ?? tmpdir();
+    const screenshotDir = expectsScreenshot ? mkdtempSync(join(screenshotTempRoot, 'gopeak-runtime-screenshot-')) : null;
     const screenshotPath = screenshotDir ? join(screenshotDir, 'capture.png') : null;
-    const runtimeParams = screenshotPath ? { ...params, output_path: screenshotPath } : params;
+    const screenshotPathForGodot = screenshotPath
+      ? wslTranslatePathForGodot(screenshotPath, screenshotInterop, 'Runtime screenshot file')
+      : null;
+    const runtimeParams = screenshotPathForGodot ? { ...params, output_path: screenshotPathForGodot } : params;
     const cleanupScreenshotDir = () => {
       if (screenshotDir) {
         rmSync(screenshotDir, { recursive: true, force: true });
@@ -1014,7 +1024,7 @@ class GodotServer {
 
         if (parsed.type === 'screenshot_file' && parsed.path) {
           const returnedPath = String(parsed.path);
-          if (!screenshotPath || normalize(returnedPath) !== normalize(screenshotPath)) {
+          if (!screenshotPath || !screenshotPathForGodot || normalize(returnedPath) !== normalize(screenshotPathForGodot)) {
             cleanupScreenshotDir();
             resolve({
               content: [{ type: 'text', text: `Rejected screenshot file path outside the GoPeak-managed capture path: '${returnedPath}'` }],
