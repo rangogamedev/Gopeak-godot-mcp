@@ -126,8 +126,8 @@ export const CORE_TOOL_GROUPS: Record<string, ToolGroupDefinition> = {
   },
   core_editor: {
     description: 'Editor launch, run, stop, close, restart, play/stop in-editor debug game, debug output, fs scanning probe, version info',
-    tools: ['launch_editor', 'run_project', 'stop_project', 'close_editor', 'restart_editor', 'play_scene', 'stop_playing_scene', 'get_play_state', 'get_fs_scanning_status', 'get_debug_output', 'get_editor_status', 'get_godot_version'],
-    keywords: ['editor', 'launch', 'run game', 'stop game', 'play scene', 'stop playing', 'play state', 'close editor', 'restart editor', 'fs scanning', 'debug output', 'editor status', 'godot version'],
+    tools: ['launch_editor', 'run_project', 'run_project_headless', 'stop_project', 'close_editor', 'restart_editor', 'play_scene', 'stop_playing_scene', 'get_play_state', 'get_fs_scanning_status', 'get_debug_output', 'get_editor_status', 'get_godot_version'],
+    keywords: ['editor', 'launch', 'run game', 'run headless', 'headless', 'stop game', 'play scene', 'stop playing', 'play state', 'close editor', 'restart editor', 'fs scanning', 'debug output', 'editor status', 'godot version'],
   },
   core_scene: {
     description: 'Scene creation, saving, node tree manipulation',

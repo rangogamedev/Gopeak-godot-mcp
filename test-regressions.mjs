@@ -1543,10 +1543,33 @@ async function main() {
   testEditorLifecycleTracking();
   assert.match(INDEX_SOURCE, /key\.startsWith\('_'\)/, 'index.ts should preserve sentinel keys like _type during parameter normalization');
   assert.match(INDEX_SOURCE, /@file:/, 'index.ts should pass operation params via @file: temp payloads');
+  // run_project (windowed) + run_project_headless (--headless) share ONE handler, selected by tool name
+  // (not a boolean param). Windowed is the default so capture-screenshot always works; headless is the
+  // opt-in, no-pixels, faster run. See README/CHANGELOG and wiki mcp_footguns.
   assert.match(
     INDEX_SOURCE,
-    /private async handleRunProject[\s\S]*?const cmdArgs = \[[^\]]*'--headless'[^\]]*'-d'[^\]]*'--path'[^\]]*args\.projectPath[^\]]*\]/,
-    'run_project should launch Godot with --headless in handleRunProject cmdArgs',
+    /private async handleRunProject\(args: any, headless = false\)/,
+    'handleRunProject should take a headless flag (windowed default; the headless tool passes true)',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /const prefixArgs = headless \? \['--headless', '-d'\] : \['-d'\];/,
+    'handleRunProject should prepend --headless only when headless is true (windowed otherwise)',
+  );
+  assert.match(
+    INDEX_SOURCE,
+    /case 'run_project_headless':\s*\n\s*return await this\.handleRunProject\(request\.params\.arguments, true\)/,
+    'run_project_headless should dispatch handleRunProject with headless=true',
+  );
+  assert.match(
+    TOOL_DEFS_SOURCE,
+    /name: 'run_project_headless'/,
+    'tool-definitions should expose a run_project_headless tool',
+  );
+  assert.match(
+    TOOL_GROUPS_SOURCE,
+    /'run_project', 'run_project_headless'/,
+    'core_editor group should include run_project_headless next to run_project',
   );
   assert.match(
     CLI_NOTIFY_SOURCE,

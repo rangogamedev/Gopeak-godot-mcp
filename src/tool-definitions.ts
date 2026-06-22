@@ -20,7 +20,25 @@ export function buildToolDefinitions(godotBridgePort: number): MCPToolDefinition
         },
         {
           name: 'run_project',
-          description: 'Launches a Godot project in a new window and captures output. Use to test gameplay or verify script behavior. Runs until stop_project is called. Use get_debug_output to retrieve logs.',
+          description: 'Launches a Godot project in a WINDOW and captures output. Use for ANY work that needs rendered pixels — visual iteration, layout/UI checks, capture_screenshot/capture_viewport. Also fine for data/logic runs (call_runtime_method, inspect_runtime_tree). For a faster, windowless data/logic run where you do NOT need pixels, use run_project_headless instead. Runs until stop_project is called (only one run at a time — a new run replaces the current one). Use get_debug_output to retrieve logs.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Absolute path to project directory containing project.godot. Use the same path across all tool calls in a workflow.',
+              },
+              scene: {
+                type: 'string',
+                description: 'Optional: specific scene to run (e.g., "scenes/TestLevel.tscn"). If omitted, runs main scene from project settings.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'run_project_headless',
+          description: 'Launches a Godot project with NO window (--headless): faster, no popup. Use ONLY for data/logic runs where you do NOT need rendered pixels — Godot headless disables ALL rendering, so capture_screenshot/capture_viewport return a BLACK frame. For anything visual (visual iteration, layout, screenshots), use run_project instead. Runs until stop_project is called (only one run at a time — a new run replaces the current one). Use get_debug_output to retrieve logs.',
           inputSchema: {
             type: 'object',
             properties: {

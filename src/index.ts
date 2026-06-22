@@ -130,6 +130,7 @@ class GodotServer {
     'project.setting.set': 'set_project_setting',
     'editor.launch': 'launch_editor',
     'editor.run': 'run_project',
+    'editor.run-headless': 'run_project_headless',
     'editor.stop': 'stop_project',
     'editor.close': 'close_editor',
     'editor.restart': 'restart_editor',
@@ -2073,7 +2074,9 @@ class GodotServer {
         case 'launch_editor':
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
-          return await this.handleRunProject(request.params.arguments);
+          return await this.handleRunProject(request.params.arguments, false);
+        case 'run_project_headless':
+          return await this.handleRunProject(request.params.arguments, true);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -2570,7 +2573,7 @@ class GodotServer {
    * Handle the run_project tool
    * @param args Tool arguments
    */
-  private async handleRunProject(args: any) {
+  private async handleRunProject(args: any, headless = false) {
     // Normalize parameters to camelCase
     args = this.normalizeParameters(args);
     
@@ -2631,8 +2634,13 @@ class GodotServer {
       // inherits this env) binds the right port and the discovery file exists.
       this.ensureSessionProject(args.projectPath);
 
-      const prepared = this.prepareProjectScopedCommand(args.projectPath, ['-d'], suffixArgs);
-      this.logDebug(`Running Godot project: ${prepared.projectPathForDisplay}`);
+      // Windowed (default, run_project) renders frames so capture-screenshot/-viewport work. Headless
+      // (run_project_headless) prepends --headless for a fast, windowless data/logic run — but Godot's
+      // headless mode disables ALL rendering, so screenshots are BLACK. The two run tools differ ONLY by
+      // this flag; the WSL path translation, cwd, env, and output capture below are shared.
+      const prefixArgs = headless ? ['--headless', '-d'] : ['-d'];
+      const prepared = this.prepareProjectScopedCommand(args.projectPath, prefixArgs, suffixArgs);
+      this.logDebug(`Running Godot project${headless ? ' (headless)' : ''}: ${prepared.projectPathForDisplay}`);
       const process = spawn(prepared.command, prepared.args, { stdio: 'pipe', cwd: prepared.cwd, env: this.buildGodotSpawnEnv() });
       const output: string[] = [];
       const errors: string[] = [];
