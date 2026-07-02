@@ -10,6 +10,10 @@ const SETTING_BRIDGE_PORT := "mcp/editor/bridge_port"
 const SETTING_DAP_RELAY_ENABLED := "mcp/editor/dap_relay_enabled"
 const SETTING_DAP_RELAY_PORT := "mcp/editor/dap_relay_port"
 const DAP_RELAY_DEFAULT_PORT := 6016
+# Mirrors the runtime addon's GOPEAK_RUNTIME_DISABLED: headless CI editor boots
+# have no gopeak server, so the client otherwise spins connect_failed/backoff
+# churn for the whole run. Restrict to hooks/CI scripts.
+const DISABLE_ENV := "GOPEAK_EDITOR_DISABLED"
 
 var _mcp_client: Node
 var _tool_executor: Node
@@ -18,6 +22,10 @@ var _status_label: Label
 
 
 func _enter_tree() -> void:
+	if OS.has_environment(DISABLE_ENV) and OS.get_environment(DISABLE_ENV) == "1":
+		print("[MCP Editor] Disabled by %s — passive mode (no bridge connect, no DAP relay)" % DISABLE_ENV)
+		print("[MCP Editor] To re-enable, unset %s (do NOT set it in shell rc files; restrict to hooks/CI scripts)" % DISABLE_ENV)
+		return
 	_plugin_log("enter_tree_start")
 	_register_project_settings()
 	_plugin_log("project_settings_registered")
