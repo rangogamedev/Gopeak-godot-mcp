@@ -217,7 +217,10 @@ func _execute_command(command: String, params: Dictionary) -> Dictionary:
 	match command:
 		"ping":
 			return {"type": "pong", "timestamp": Time.get_unix_time_from_system()}
-		
+
+		"quit":
+			return _cmd_quit()
+
 		"get_tree":
 			return _cmd_get_tree(params)
 		
@@ -259,6 +262,14 @@ func _execute_command(command: String, params: Dictionary) -> Dictionary:
 		
 		_:
 			return {"type": "error", "message": "Unknown command: " + command}
+
+
+func _cmd_quit() -> Dictionary:
+	# Graceful whole-process teardown, reachable across the WSL→Windows boundary
+	# where the server's proxy-kill cannot follow (an orphaned game keeps holding
+	# the runtime port). Deferred so this response flushes before the exit.
+	get_tree().call_deferred("quit")
+	return {"type": "quitting", "timestamp": Time.get_unix_time_from_system()}
 
 
 func _cmd_get_tree(params: Dictionary) -> Dictionary:
