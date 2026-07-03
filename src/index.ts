@@ -2628,11 +2628,12 @@ class GodotServer {
         );
       }
 
-      // Kill any existing process
-      if (this.activeProcess) {
-        this.logDebug('Killing existing Godot process before starting a new one');
-        this.activeProcess.process.kill();
-      }
+      // Stop any existing run FIRST — unconditionally, not just when a proxy is
+      // tracked: on WSL→Windows spawns a proxy-kill alone orphans the Windows-side
+      // game window, which keeps holding the runtime port and turns the next run
+      // passive (friction editor-run-orphan-window). stopActiveRun's runtime-quit
+      // also reaps an already-orphaned game whose proxy died earlier.
+      await this.stopActiveRun('replacing with a new run');
 
       const suffixArgs: string[] = [];
       if (args.scene && this.validatePath(args.scene)) {
@@ -2858,11 +2859,9 @@ class GodotServer {
       );
     }
 
-    this.logDebug('Stopping active Godot process');
-    this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
-    this.activeProcess = null;
+    await this.stopActiveRun('stop_project');
 
     return {
       content: [
@@ -3052,6 +3051,35 @@ class GodotServer {
         }],
         isError: true,
       };
+    }
+  }
+
+  /**
+   * Best-effort teardown of whatever game holds this server's runtime port
+   * (normally this session's run; an identity check via the welcome frame's
+   * project_name is a possible follow-up). Two layers,
+   * both required on WSL→Windows spawns:
+   *  1. Runtime-socket `quit` — reaches the WINDOWS game process, which a
+   *     proxy-kill cannot (killing the WSL-side wrapper orphans the game
+   *     window, which keeps holding the runtime port so the next run binds
+   *     passive). Bounded at 2.5s; with no game listening the connect
+   *     refuses immediately.
+   *  2. Proxy kill + tracking reset for the WSL-side wrapper itself.
+   * Never throws — a failed teardown must not block the caller's own path.
+   */
+  private async stopActiveRun(reason: string): Promise<void> {
+    this.logDebug(`Stopping active run (${reason})`);
+    try {
+      await Promise.race([
+        this.handleRuntimeCommand('quit', {}),
+        new Promise((resolve) => setTimeout(resolve, 2500).unref()),
+      ]);
+    } catch {
+      // defensive only — handleRuntimeCommand resolves (never rejects) today
+    }
+    if (this.activeProcess) {
+      this.activeProcess.process.kill();
+      this.activeProcess = null;
     }
   }
 
