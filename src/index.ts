@@ -3055,7 +3055,9 @@ class GodotServer {
   }
 
   /**
-   * Best-effort teardown of the CURRENT session's running game. Two layers,
+   * Best-effort teardown of whatever game holds this server's runtime port
+   * (normally this session's run; an identity check via the welcome frame's
+   * project_name is a possible follow-up). Two layers,
    * both required on WSL→Windows spawns:
    *  1. Runtime-socket `quit` — reaches the WINDOWS game process, which a
    *     proxy-kill cannot (killing the WSL-side wrapper orphans the game
@@ -3070,10 +3072,10 @@ class GodotServer {
     try {
       await Promise.race([
         this.handleRuntimeCommand('quit', {}),
-        new Promise((resolve) => setTimeout(resolve, 2500)),
+        new Promise((resolve) => setTimeout(resolve, 2500).unref()),
       ]);
     } catch {
-      // no game listening / socket error — nothing to quit
+      // defensive only — handleRuntimeCommand resolves (never rejects) today
     }
     if (this.activeProcess) {
       this.activeProcess.process.kill();
