@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, writeSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, writeSync, mkdtempSync, rmSync, unlinkSync, copyFileSync } from 'fs';
 import { tmpdir, release } from 'os';
 import { spawn, exec, execFile } from 'child_process';
 import { createConnection as createTcpConnection } from 'node:net';
@@ -1797,8 +1797,19 @@ class GodotServer {
 
       // Add debug arguments if debug mode is enabled
       const debugArgs = this.godotDebugMode ? ['--debug-godot'] : [];
+      // The ops script ships under the server's build dir, which may be an ext4
+      // (/home) path Windows Godot cannot read. When staging to a Windows-visible
+      // temp is in effect (wsl_windows mode → windowsTempRoot set), copy it next to
+      // the params file so it resolves to /mnt; otherwise translate in place (native
+      // Godot needs no staging). Mirrors the params-file staging above.
+      let operationsScriptSource = this.operationsScriptPath;
+      if (windowsTempRoot) {
+        const stagedOperationsScript = join(paramsDir, 'godot_operations.gd');
+        copyFileSync(this.operationsScriptPath, stagedOperationsScript);
+        operationsScriptSource = stagedOperationsScript;
+      }
       const operationsScriptPath = this.translatePathForGodot(
-        this.operationsScriptPath,
+        operationsScriptSource,
         interop,
         'Godot operations script'
       );
