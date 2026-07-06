@@ -4,6 +4,9 @@ All notable changes to GoPeak (godot-mcp) will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- **Release/export builds no longer bind the runtime inspection socket.** `_start_server()` is gated on `OS.is_debug_build()` — a shipped release build goes passive (no port bind, no runtime calls). Debug exports still bind (deliberate: `export-run` and tester workflows rely on runtime attachment); the `GOPEAK_RUNTIME_DISABLED=1` opt-out is unchanged for debug builds.
+
 ### Added
 - **Multi-session support: multiple agents/worktrees can drive Godot at once.** Each gopeak instance auto-allocates a free bridge port (the configured port is now a base hint, not a hard pin) and derives its runtime + DAP-relay ports from that offset, so concurrent worktrees never collide. A single session with free defaults still uses `6505`/`7777`/`6016` unchanged.
 - **Per-project discovery file** `<project>/.gopeak/bridge.json`, written by the server and read by the editor + runtime addons so each project's Godot connects to *its* session's ports with zero manual config. Addon precedence: discovery file → env → Project Settings → default. Add `.gopeak/` to your project's `.gitignore`.

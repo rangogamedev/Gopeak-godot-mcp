@@ -1025,6 +1025,13 @@ function testStartupActiveGroups() {
 }
 
 function testRuntimeBindGraceful() {
+  // Security guard: release/export builds must never bind the inspection socket.
+  assert.match(
+    RUNTIME_SOURCE,
+    /if not OS\.is_debug_build\(\):/,
+    'runtime autoload must gate _start_server on OS.is_debug_build() so release exports never bind',
+  );
+
   // The env-gate constant is declared so consumers can grep for the canonical name.
   assert.match(
     RUNTIME_SOURCE,
