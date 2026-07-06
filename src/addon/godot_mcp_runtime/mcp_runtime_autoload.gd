@@ -162,6 +162,14 @@ func _process(_delta: float) -> void:
 
 
 func _start_server() -> void:
+	# Debug builds only: a shipped export must never listen on a socket that
+	# accepts runtime-inspection commands (set_property/call_method/inject input).
+	# Deliberately is_debug_build(), NOT has_feature("editor"): debug exports must
+	# keep binding so export-run / tester attachment works; only release goes passive.
+	if not OS.is_debug_build():
+		_enabled = false
+		print("[MCP Runtime] Release/export build — passive mode (no port bind, no runtime calls)")
+		return
 	if OS.has_environment(DISABLE_ENV) and OS.get_environment(DISABLE_ENV) == "1":
 		_enabled = false
 		print("[MCP Runtime] Disabled by %s — passive mode (no port bind, no runtime calls)" % DISABLE_ENV)

@@ -21,4 +21,5 @@ We will acknowledge receipt within 48 hours and provide a fix timeline.
 
 - **Path Traversal**: MCP Resources (`godot://` URIs) include path traversal protection
 - **Localhost Only**: Runtime addon TCP (port 7777), LSP (port 6005), and DAP (port 6006) connections are localhost-only
+- **No Release Bind**: the runtime addon never binds its socket in release/export builds (`OS.is_debug_build()` gate); debug exports still bind so tester/`export-run` workflows keep runtime inspection
 - **No Remote Execution**: All file operations are restricted to the Godot project directory
