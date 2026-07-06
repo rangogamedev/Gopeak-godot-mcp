@@ -2692,7 +2692,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output.`,
+            text: `Godot project started in debug mode. Use get_debug_output to see output. Call stop_project when you are done with the run — an unstopped run leaves the game window open (on WSL, as an orphan holding the runtime port).`,
           },
         ],
       };
