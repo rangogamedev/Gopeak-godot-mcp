@@ -965,6 +965,7 @@ class GodotServer {
   private async handleRuntimeCommand(
     command: string,
     args: unknown,
+    timeoutMs?: number,
   ): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> }> {
     const params = (args && typeof args === 'object') ? args as Record<string, unknown> : {};
     // Target THIS session's allocated runtime port (falls back to the env/default
@@ -973,7 +974,10 @@ class GodotServer {
     const RUNTIME_PORT = this.allocatedRuntimePort || resolveDefaultRuntimePort();
     const RUNTIME_HOST = resolveDefaultRuntimeHost();
     const timeoutOverride = Number.parseInt(process.env.GOPEAK_RUNTIME_TIMEOUT_MS || '', 10);
-    const TIMEOUT_MS = Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000;
+    // timeoutMs (caller-scoped) wins: the timer OWNS the socket, so a bounded caller
+    // like stopActiveRun gets real cancellation, not an abandoned in-flight connect.
+    const TIMEOUT_MS = timeoutMs
+      ?? (Number.isInteger(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : 10000);
     const expectsScreenshot = command === 'capture_screenshot' || command === 'capture_viewport';
     // Under WSL→Windows Godot, the runtime addon writes the PNG from the WINDOWS Godot process, which
     // cannot write a Linux /tmp path (FileAccess fails: "Failed to save screenshot as PNG: 7"). Put the
@@ -2703,7 +2707,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot project started in debug mode. Use get_debug_output to see output.`,
+            text: `Godot project started in debug mode. Use get_debug_output to see output. Call stop_project when you are done with the run — an unstopped run leaves the game window open (on WSL, as an orphan holding the runtime port).`,
           },
         ],
       };
@@ -3081,10 +3085,12 @@ class GodotServer {
   private async stopActiveRun(reason: string): Promise<void> {
     this.logDebug(`Stopping active run (${reason})`);
     try {
-      await Promise.race([
-        this.handleRuntimeCommand('quit', {}),
-        new Promise((resolve) => setTimeout(resolve, 2500).unref()),
-      ]);
+      // Bounded via the command's own timeout so the socket is DESTROYED when the
+      // wait ends. The previous Promise.race abandoned the in-flight connect alive:
+      // on WSL the SYN to the not-yet-bound Windows port kept retransmitting, completed
+      // the handshake once the NEW game bound the runtime port, and delivered the stale
+      // quit — instantly killing every fresh run_project (exit code 0).
+      await this.handleRuntimeCommand('quit', {}, 2500);
     } catch {
       // defensive only — handleRuntimeCommand resolves (never rejects) today
     }
